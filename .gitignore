@@ -1,0 +1,46 @@
+.internal_docs.md
+
+# Rust build output
+/target/
+**/target/
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.idea/
+.vscode/
+*.iml
+
+# Rust tools
+.cargo/
+rust-project.json
+
+# Coverage and profiling output
+coverage/
+*.profraw
+*.profdata
+tarpaulin-report.html
+lcov.info
+
+# Benchmark output
+criterion/
+
+# Generated documentation
+/doc/
