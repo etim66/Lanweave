@@ -1,53 +1,172 @@
 # Error Handling
 
-## Model
+This document groups the version 1 outcomes defined in [Message Format](MESSAGE_FORMAT.md). Wire responses carry stable codes only. Paths, OS errors, stack traces, parser offsets, hashes, key material, pairing codes and transcripts, failure counts, expiry state, and free-form diagnostics remain local.
 
-Inside an implementation, errors should keep enough type and context to help the maintainer diagnose them. On the wire, they need to be much less revealing. When it is safe to reply, Lanweave maps a local failure to a bounded `Error` with a stable code, a fatal flag, optional retry advice, a correlation ID, and at most 512 bytes of locally written text.
+## Authentication Failure
 
-An implementation never displays a peer's text without escaping it and never sends source chains, local paths, addresses, key details, parser offsets, or stack traces. Local errors are grouped into discovery, transport, protocol, validation, pairing, cryptographic, filesystem, transfer, cancellation, and internal categories.
+Pairing authentication failures use one coarse code: `error` with
+`authentication_failed` when a reply is safe, or a silent close otherwise.
+This rule does not hide the protocol phase, response timing, or whether a
+ceremony is currently available. The receiver does not run a dummy PAKE.
 
-A peer cannot force a state transition merely by setting `fatal=true`. The receiver first validates the error's context, then applies its own state-machine rules.
+- Wrong pairing code.
+- The ceremony expired before sender confirmation was admitted.
+- The shared five-attempt budget was exhausted, including the fifth failure.
+- The sender confirmation did not bind the expected TLS exporter or exact hello
+  JSON body bytes.
+- Any other SPAKE2 transcript, HKDF, HMAC, or confirmation failure for which an
+  authentication response is safe.
+- A syntactically valid receiver confirmation (`cB`) failed sender-side
+  cryptographic verification.
 
-## Protocol-visible codes
+The wire does not report attempts remaining, expiry, lockout, or the failed
+cryptographic check in an error field. In particular, ceremony expiry does not
+use `timeout`. An unavailable, expired, exhausted, cancelled, or already
+sender-confirmed ceremony may fail when the sender share arrives, before the
+receiver sends a share. A valid wrong-code, exporter-binding, or confirmation
+failure occurs later, when `cA` is verified. These phase and timing differences
+explicitly reveal ceremony availability and are permitted; only the error code
+and fields are coarse. Receiver-side UI and local logs may distinguish causes
+without including secrets.
 
-Legend: **Remote** says whether a safe coarse code may be sent; **Recoverable** means recovery without starting a new request/session.
+Only a failed, admitted verification of a syntactically valid sender-confirmation
+record (`cA`) charges the ceremony's failure budget. The receiver serializes
+admission and verification across connections and atomically rechecks the
+monotonic deadline and ceremony state, verifies the confirmation and bindings,
+then commits `consumed_sender_confirmed` or one failure. The fifth failure
+atomically commits both failure count 5 and `consumed_exhausted` before any
+reply. Expiry, unavailability, disconnect before commit, malformed frames,
+JSON, pairing records, and shares do not charge the five attempts.
 
-| Code | When | Remote | Recoverable | Transition / close | Local logging |
-| --- | --- | :---: | :---: | --- | --- |
-| `UnsupportedVersion` | No common major/minor or required capability | Yes | No | Negotiation → Failed; graceful close | Offered ranges/capabilities, peer endpoint; no secrets |
-| `InvalidMessage` | Schema, canonical form, field, correlation, or bound invalid | Yes, once if parse/state safe | No | Current → Failed; close | Message type/ID, validation rule; bounded/redacted fields |
-| `UnexpectedMessage` | Known message not allowed in current state/role | Yes | Usually no | Fail session; close on pre-auth/repeat | Expected/current state and type |
-| `InvalidState` | Peer requests action inconsistent with session context | Yes, coarse | No | Fail affected operation; usually close | State/event and IDs |
-| `InvalidRequest` | Request summary/count/size/policy invalid | Yes | New request possible | Request → Rejected/Failed; connection may remain | Rule and request ID |
-| `ExpiredRequest` | Decision/submission after request deadline | Yes | New request | Pending request → Failed; connection may remain | Duration, request ID; not wall-clock claims |
-| `RequestRejected` | Receiver user/policy rejects | Yes | New request | → Rejected; no forced close | Coarse reason only; local UI choice may be sensitive |
-| `InvalidToken` | Token/proof fails with attempts left | Yes, indistinguishable | Retry within same challenge | Pairing → Waiting; do not close yet | Attempt number, token ID; never value |
-| `ExpiredToken` | Challenge deadline elapsed | Yes | New approval/challenge | Pairing → Failed; consume token | Token ID and monotonic elapsed |
-| `TooManyTokenAttempts` | Attempt budget exhausted | Yes | No in same request | Pairing → Failed; rate-limit and close | Counts/source context; no guesses |
-| `AuthenticationFailed` | Signature, key confirmation, transcript, AEAD, identity fails | Optional generic only | No | Secure/session → Failed; erase secrets, immediate close | Stage and library error class; never key/material |
-| `KeyExchangeFailed` | Negotiated handshake cannot complete without revealing auth detail | Optional generic | No | → Failed; erase/close | Profile, stage, public algorithm IDs |
-| `SessionTimeout` | Idle/handshake deadline reached | Yes if channel valid | New session | → Failed; close | Timer/state/activity class |
-| `DeviceBusy` | Concurrency/pending policy reached | Yes with bounded retry hint | Retry later | Reject request/connection gracefully | Counters and policy, not other peer data |
-| `InsufficientStorage` | Preflight or write reports no capacity | Yes | Possibly new smaller request | Transfer → Failed; close/cleanup partials | Required/available sizes if local policy permits; local path redacted |
-| `InvalidFilename` | Name cannot map safely | Yes | Metadata may be resent only if protocol later allows; 1.0 no | Transfer → Failed before chunks | File ID and rule; sanitized name only |
-| `FileUnavailable` | Sender source missing/changed/unreadable | Yes | No for file in 1.0 | Transfer → Failed/cancelled | Local OS error/path protected |
-| `HashMismatch` | Received length/hash differs | Yes | No in 1.0 | File/transfer → Failed; never finalize | File ID, expected/actual hashes only in protected local debug policy |
-| `TransferCancelled` | User or policy cancels | Yes via dedicated message preferred | No | → Cancelled; cleanup; close gracefully | Initiator and coarse reason |
-| `FrameTooLarge` | Header length exceeds class maximum | Usually no payload needed | No | Close immediately, optionally minimal error | Claimed length/endpoint |
-| `RateLimited` | Request/connection/work budget exceeded | Yes, coarse retry hint | Retry later | Reject operation; may close | Bucket/category and duration |
-| `InternalError` | Unexpected local invariant/resource failure | Yes, generic only | No | Fail safely; close/cleanup | Full local diagnostic without secrets |
+The failure counter is not a resource-control mechanism. Implementations
+separately bound active and in-flight pairing states, expensive cryptographic
+work, queues, concurrency, and per-source and global CPU rates. Every ceremony
+consumption transition best-effort cancels and zeroizes all other active pairing
+states for that ceremony; no such state may subsequently be admitted.
 
-## Category handling
+An authentication failure terminates only its connection. The active ceremony
+and its original deadline survive reconnects after failures one through four.
+The ceremony is consumed as `consumed_sender_confirmed` on valid `cA`, or on
+expiry, local cancellation, or the fifth failed admitted confirmation. Ceremony
+consumption is not itself mutual pairing success: the receiver becomes paired
+only after its complete framed `cB` is accepted by the TLS writer and flush
+succeeds, while the sender becomes paired only after receiving and verifying
+`cB`. Writer acceptance plus a successful flush is a local commit boundary, not
+a delivery guarantee.
 
-- **Discovery:** registration/browse/resolve errors affect visibility, not active sessions. Retry with backoff and show actionable local context.
-- **Transport:** connect refused/timeout may try another resolved address; mid-session EOF/reset fails transfer. Do not map all transport errors to peer fault.
-- **Protocol/validation:** one safely parsed non-cryptographic violation may receive an error; ambiguity/repetition closes.
-- **Pairing:** preserve indistinguishable failure messages and fixed attempt accounting.
-- **Cryptographic:** fail closed, erase keys, do not retry in the same transcript, avoid oracles.
-- **Filesystem:** keep local path/OS details local; remote gets the semantic code only.
-- **User cancellation:** idempotent and expected, not logged as an internal failure.
-- **Internal:** no panic should leave finalized unverified files; top-level cleanup guards are required.
+## Manifest Rejection
 
-## Error-message rules
+After pairing succeeds, `transfer_response` rejects the complete manifest before
+file data. The order is whole-manifest validation, user acceptance, destination
+preparation, an accepting `transfer_response`, and then `ready`. If destination
+preparation fails after user acceptance, the receiver sends a rejecting
+`transfer_response` with the applicable reason; it never sends acceptance first.
 
-`Error` MUST have a fresh message ID and correlate to the rejected message/request/session when known. An error MUST NOT be sent in response to an unparseable header, another error if that would loop, an AEAD authentication failure, or after close. Unknown error codes are handled as `InternalError` semantics without trusting remote fatal/retry advice. See [Message Format](MESSAGE_FORMAT.md).
+| Reason | Meaning |
+| --- | --- |
+| `user_rejected` | The receiving user declined the request. |
+| `invalid_manifest` | A structurally valid request fails bounded semantic count, size, or checked-total admission. Wrong JSON shapes or types use `invalid_message`. |
+| `invalid_filename` | A name is not a safe destination filename component. |
+| `name_conflict` | Requested names are duplicate or platform-equivalent. |
+| `destination_exists` | A requested destination already exists. |
+| `insufficient_storage` | Preflight storage policy cannot accept the complete manifest. |
+| `resource_limit` | A bounded local request or concurrency policy rejected the request. |
+| `unavailable` | The receiver cannot accept a transfer now. |
+
+Rejection is terminal for the connection. It is not an `error`, and version 1 does not offer subset acceptance, rename, or overwrite. Pairing success is not manifest approval; the receiver validates, prompts for, and accepts or rejects the manifest separately.
+
+## File Failure
+
+`file_result` reports failure of the current manifest index:
+
+| Code | Meaning |
+| --- | --- |
+| `size_mismatch` | The sender sent excess DATA or ended the file before its declared size. |
+| `hash_mismatch` | The receiver's SHA-256 differs from `file_end`. |
+| `write_failed` | Writing, closing, syncing under local policy, or finalizing the temporary file failed. |
+| `destination_exists` | A destination appeared after preflight and no-replace finalization refused to overwrite it. |
+| `insufficient_storage` | Storage became unavailable while receiving the current file. |
+
+The receiver MAY send a failed result while the sender is still producing DATA,
+before any `file_end` for that file. A failed result is terminal: the sender
+stops DATA, the receiver deletes the current temporary file, the verified prefix
+remains, and later files are not attempted.
+
+## Cancellation
+
+`cancel` represents intentional cancellation of this connection in any
+nonterminal state, or a source-side condition that prevents an accepted
+transfer from continuing:
+
+| Code | Meaning |
+| --- | --- |
+| `user_cancelled` | A local user cancelled the connection. |
+| `source_unavailable` | After an accepting `transfer_response`, the sender cannot read a source exactly as accepted. It is sender-only and invalid before acceptance. |
+| `shutdown` | The local application is shutting down. |
+
+`user_cancelled` and `shutdown` may be used in any nonterminal connection state.
+Sending or receiving a valid `cancel` is terminal. A peer does not acknowledge a
+valid cancellation. A malformed or wrong-state `cancel`, including
+`source_unavailable` before acceptance or an unknown code, receives `error` with
+`invalid_message` when safe. Cancelling the receiver-wide ceremony is a local
+action that consumes it; it need not produce a wire response on unrelated
+connections.
+
+## Protocol Error
+
+`error` reports a connection-level protocol or security failure:
+
+| Code | Meaning |
+| --- | --- |
+| `unsupported_version` | An otherwise valid `hello` contains a non-negative integer version other than `1`. Missing or wrongly typed versions use `invalid_message`. |
+| `invalid_message` | A bounded control violates its schema, limits, role, or state, including `transfer_request` before pairing or DATA before `ready` (including before pairing or manifest acceptance). |
+| `authentication_failed` | Pairing authentication failed and a single coarse response is safe. |
+| `timeout` | A non-ceremony protocol step or DATA progress deadline expired. |
+| `resource_limit` | A connection-level bounded resource policy was exceeded after request admission. |
+| `internal_error` | A local failure prevents safe continuation and no file-specific result applies. |
+
+`error` has only `type` and `code`. It has no fatal flag, scope, identifier, attempt count, or remote diagnostic string.
+
+All registries are closed. An unknown rejection, file-result, or cancellation value is `invalid_message`. An unknown `error` code closes the connection without a response, which prevents an error loop.
+
+Response precedence is deterministic:
+
+- Unsafe framing and hard frame-bound failures close without a response.
+- Safely framed malformed JSON, wrong JSON types, unknown fields, malformed pairing shares or confirmations, invalid points or lengths, and wrong-state controls use `error` with `invalid_message` when safe and are subject to separate rate limits.
+- `transfer_request` before pairing uses `error` with `invalid_message`; it is never treated as a manifest rejection.
+- A safely parsed post-pairing `transfer_request` that fails semantic manifest admission uses rejecting `transfer_response`.
+- A syntactically valid sender confirmation admitted against an active ceremony that fails cryptographic verification uses only `authentication_failed` or silent close. A correctly encoded and ordered receiver confirmation that fails sender-side verification uses the same terminal outcome but does not affect the receiver's failed-confirmation counter.
+- An unavailable, expired, exhausted, cancelled, or sender-confirmed ceremony may use `authentication_failed` or silent close at sender-share processing, without generating a dummy receiver share.
+- Excess DATA or premature `file_end` for the active current file uses failed `file_result` with `size_mismatch`.
+- DATA outside an active receiving-file state uses `error` with `invalid_message`.
+
+## Safe Reply Rules
+
+An implementation sends `error` only when all of these hold:
+
+- The TCP/TLS connection remains writable and framing boundaries are trusted.
+- Enough bounded input was parsed to identify a violation without reflecting attacker-controlled detail.
+- No terminal response has already been committed.
+- The peer did not send a valid `error` or `cancel`.
+- The code and fields do not encode the pairing, ceremony, or cryptographic
+  cause; phase and timing may still reveal ceremony availability.
+
+Malformed framing, impossible lengths, loss of frame synchronization, transport
+close, and unsafe authentication failures close immediately without a JSON
+response. Bounded malformed JSON with intact framing may receive `error` with
+`invalid_message`. Implementations MUST NOT vary authentication error codes or
+fields by authentication cause, but they need not conceal phase, timing, or
+ceremony availability and MUST NOT fabricate dummy PAKE work for that purpose.
+
+## Cleanup
+
+A pre-transfer connection failure has no file cleanup and does not consume an
+active ceremony unless `cA` committed `consumed_sender_confirmed`, or expiry,
+cancellation, or the fifth failed admitted confirmation consumed it. On
+ceremony consumption the receiver also best-effort cancels and zeroizes all
+other pairing states for that ceremony. A failed `file_result`, `cancel`,
+`error`, or active-transfer transport close prevents all later manifest
+entries. The receiver closes and deletes the current temporary file and retains
+finalized files in the verified prefix. The sender stops producing DATA
+immediately. Cleanup is idempotent, and cleanup failures are logged locally
+without exposing local paths to the peer.

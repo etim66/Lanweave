@@ -1,71 +1,57 @@
-# First-Week Research Plan
+# Research Plan
 
-## Evidence standard
+Research is organized by release risk rather than a fixed week. Record the date, platform, versions, primary sources, reproducible steps, results, limitations, licence status, and affected decision for every experiment.
 
-The point of this week is to replace plausible assumptions with evidence. A crate name, README, or product page is not enough to settle a protocol decision.
+## Priority 1: PAKE Implementation And Composition
 
-For each result, record the version, date, platform, primary documentation, a reproducible experiment, known limitations, licence and maintenance signals, and the decision the result affects. Every library capability listed below still needs verification against current documentation and source.
+This is the primary security and release gate.
 
-## Day 1 — Discovery and comparable systems
+Questions:
 
-| Topic | Questions | Evidence/tools to verify | Decision / output |
-| --- | --- | --- | --- |
-| mDNS on Linux/Windows/macOS | Registration APIs/daemons? interface and IPv6 behavior? conflict rename? TTL/goodbye? firewall prompt? | OS docs, packet captures, two-host matrix, reboot/interface-change tests | DD-001; discovery behavior report |
-| Rust mDNS libraries | Pure Rust vs system service? async API? multi-interface? maintenance/licence? TXT limits? | Official crate/source docs and a tiny disposable spike (later implementation phase) | Library shortlist with gaps; no capability assumptions |
-| Comparable systems | How do open systems handle discovery, consent, pairing, identity, chunks, resume, paths? | Public protocol/source/docs for LocalSend, KDE Connect, Syncthing, Warpinator, Magic Wormhole, croc, Snapdrop, PairDrop; public product docs for AirDrop, Nearby Share, Quick Share | Comparative matrix; ideas only, no proprietary copying |
+- Does a candidate Rust implementation conform exactly to RFC 9382 SPAKE2-P256-SHA256-HKDF-HMAC, including point validation, exact identities, padded `w` encoding, eight-byte little-endian `TT` lengths, `Ke`/`Ka` and `KcA`/`KcB` key splits, HKDF, and HMAC confirmations?
+- Does it pass RFC 9382 vectors and independent cross-implementation vectors for sender A and receiver B?
+- Is it independently audited, maintained, constant-time where required, and capable of zeroizing code-derived and ephemeral secrets?
+- Does `rustls` 0.23 expose equal 32-byte exporter material to both peers for label `EXPORTER-Channel-Binding` with no context, and does the exporter invocation and SPAKE2 AAD composition resist exporter substitution and split-MITM scenarios?
+- Do four-byte big-endian `lp` values encode the AAD fields in exact label, exporter, sender-`hello`, receiver-`hello` order, using exact JSON body bytes without frame headers? Two 4,000-byte bodies produce the maximum valid 8,067-byte AAD; either body at 4,001 bytes must reject before PAKE work.
+- Do the four records and confirmation ordering fail closed under replay, reflection, role confusion, invalid points, wrong codes, reconnects, and concurrent attempts?
 
-Study names do not imply equivalence to Lanweave. Especially distinguish file-sharing products, synchronization systems, browser relays, and pairing tools.
+The algorithm/profile is already selected; this research does not design a new PAKE or compare alternatives for protocol selection. Evaluate candidate crates as replaceable adapters. The prototype surface includes `pakery-spake2` 0.2.1 plus `pakery-core` and `pakery-crypto` with its `p256` and `spake2` features. It is very new, unaudited, and candidate-only, and the adapter must discard returned `Ke`/`session_key` after confirmation. RustCrypto `spake2` is not acceptable because it targets an old draft, is unaudited, and is probably not constant-time.
 
-## Day 2 — Transport and async runtime
+Outputs are reproducible RFC and profile vectors for leading-zero scalar mapping, exact identities, `w`, `TT` and key splits, AAD length prefixes/order, exact hello bodies, and the exporter invocation, plus negative vectors in which every component variation rejects. Also produce interoperability results, complete dependency provenance and audit evidence, an exporter invocation and SPAKE2 AAD composition brief, certificate-verifier findings, and specialist review. No prototype result can replace an independent implementation audit or cryptographic review.
 
-| Topic | Questions | Evidence/tools to verify | Decision / output |
-| --- | --- | --- | --- |
-| Tokio networking patterns | Cancellation safety? bounded channels? split stream ownership? timeouts? graceful shutdown? | Tokio official docs/source/examples; faulted socket experiments later | Task/ownership design and cancellation checklist |
-| TCP with rustls | Self-signed/raw-key support? TLS exporter? ALPN? peer certificate hooks? TLS 1.3 suites? key logging defaults? | rustls official docs/source and standards; minimal two-peer handshake design | DD-002/DD-004/DD-010 feasibility report |
-| Quinn/QUIC | Current platform maturity? stream/backpressure API? migration? cert validation? firewall behavior? | Quinn official docs/source, RFCs, LAN benchmark plan | QUIC comparison update and revisit criteria |
-| Secure framing | Incremental parser patterns, cancellation, size class, control priority | Standards/prior art, parser prototype plan, abuse cases | Frame header and parser invariants |
+## Priority 2: Ceremony Prototype
 
-## Day 3 — Serialization and versioning
+Prototype a manager that outlives connections and stores ceremony state only in memory. Test unbiased generation over the complete 8-digit decimal space, leading zeros, a 120-second monotonic deadline, atomic accounting of five failed sender-confirmation verifications across reconnects and concurrency, sender-confirmed state before `cB` flush, and at most one mutually paired connection and transfer. Bound in-flight PAKE states and connection/source/CPU work separately. Code sharing remains private and out of band. Do not add dummy PAKE work or claim timing/resource indistinguishability between protocol phases; test only the specified coarse remote authentication outcome after valid sender-confirmation verification.
 
-| Topic | Questions | Evidence/tools to verify | Decision / output |
-| --- | --- | --- | --- |
-| CBOR | Deterministic encoding support? duplicate key behavior? size/depth limits? cross-language libraries? | RFC 8949, official library docs/source, golden vectors | DD-003 codec profile draft |
-| MessagePack/Protobuf/postcard/JSON | Evolution, canonical form, unknown fields, generated code, no-std/Rust coupling, integer fidelity | Primary specs and official tools; encode/decode sample schema across two languages | Scored alternative matrix |
-| Version/capability model | How are unknown critical fields represented? transcript handling of unknowns? | Schema experiments and compatibility cases | Registry format and 1.0↔1.x fixtures |
+## Priority 3: JSON And Frame Prototype
 
-## Day 4 — Cryptography and identity
+Build a disposable incremental parser for the proposed fixed header, JSON control payloads, and raw `DATA` payloads.
 
-| Topic | Questions | Evidence/tools to verify | Decision / output |
-| --- | --- | --- | --- |
-| Ed25519/X25519 Rust support | Audits/maintenance? key formats? zeroization? platform backends? validation pitfalls? | Official crate docs/source, security advisories, RFC test vectors | DD-004/DD-005 library shortlist |
-| HKDF/AEAD | Misuse-resistant APIs? nonce sequencing? TLS exporter versus app AEAD? | RFCs, official library docs, known-answer tests | Key schedule requirements, not custom code |
-| Token PAKE/proof | Which reviewed PAKE fits short receiver code, mutual transcript binding, Rust/other-language interop? | CFRG/RFC standards, cryptographer review, audited libraries | DD-010 decision memo; security gate |
-| Secure local key storage | Windows Credential Manager/DPAPI, macOS Keychain, Linux Secret Service/headless fallback? | OS primary docs, permission/backup/rotation experiments | DD-013 platform matrix |
+Test duplicate JSON keys, invalid UTF-8, depth and collection limits, large integers, trailing input, every frame kind, invalid/oversized lengths, and bounded allocation. Produce golden vectors suitable for another language. This work compares strict JSON library behavior; it does not benchmark CBOR or add codec negotiation.
 
-## Day 5 — Files, states, and testing
+## Priority 4: TCP/TLS Stream Prototype
 
-| Topic | Questions | Evidence/tools to verify | Decision / output |
-| --- | --- | --- | --- |
-| Streaming/hash large files | Async/sync file behavior? bounded buffers? source mutation? sparse files? SHA-256 performance? | Rust std/Tokio/crypto docs, benchmark plan on HDD/SSD, >RAM files | Chunk/window/hash benchmark plan |
-| Cross-platform config dirs | Correct data/config/cache/key locations and permissions? | OS docs and a current cross-platform directory crate's official docs | Identity/config layout decision |
-| State-machine patterns | Explicit enums/reducers vs library? compile-time states vs runtime persisted events? | Rust patterns/crate docs, property-test ergonomics | Central reducer API decision |
-| Protocol fuzzing | Parser harnesses? corpus/minimization? sanitizer support on CI platforms? | cargo-fuzz/libFuzzer and alternatives' official docs (verify) | Fuzz target inventory and CI plan |
+Run two local processes using TLS 1.3 and fresh `rcgen` 0.14 identities. Deliberately split headers and payloads across writes, coalesce multiple frames, perform partial reads/writes, disconnect at every boundary, and apply bounded-channel backpressure. Confirm that one writer preserves DATA/`file_end` FIFO order and can discard queued DATA before a terminal control without an application ACK window or second connection. Verify `hello` and all four pairing records precede any manifest disclosure.
 
-## End-of-week outputs
+Before pairing, TLS in this prototype is `Provisional TLS`. After an integrated pairing it is pairing-authenticated, but remains experimental and must not be described as safe for sensitive use until Priority 1 and the independent audit are complete.
 
-- Evidence-linked decision updates for DD-001 through DD-013.
-- mDNS/firewall three-platform result matrix.
-- Serialization golden-schema comparison and framing threat review.
-- A security-review brief for TLS/PAKE/transcript binding.
-- Library shortlist with versions, licences, maintenance, audit/advisory notes—no fabricated claims.
-- A reduced Week 2 scope if any security gate remains unresolved.
+## Priority 5: Filesystem Safety Prototype
 
-## Priority order
+Test destination planning and temporary-file finalization on intended desktop platforms.
 
-1. Pairing/TLS/identity construction and token-guessing resistance.
-2. Canonical serialization/transcript representation.
-3. Cross-platform mDNS/firewall feasibility.
-4. Key storage and filesystem-safe APIs.
-5. TCP framing/backpressure and large-file hashing.
+Cover duplicate and platform-equivalent names, case folding, Unicode normalization, reserved names, separators, symlinks, existing destinations, finalization races, disk-full behavior, source mutation, zero-byte files, and files larger than memory. Demonstrate that destination preparation precedes an accepting `transfer_response`, preparation failure rejects, and no `ready` is sent on that path. Also demonstrate multi-file success and a later-file failure that retains the verified prefix and removes the current partial.
 
-The first three can invalidate message fields or the transport profile and therefore precede implementation scaffolding.
+## Priority 6: mDNS Prototype
+
+Advertise `_lanweave._tcp.local.` with only the minimal `v=1` TXT hint. Test Linux, Windows, and macOS behavior for registration, firewall prompts, multiple interfaces, IPv4/IPv6, scoped addresses, stale records, conflicts, goodbye records, and multicast-disabled networks. Verify a direct-address fallback separately.
+
+Discovery results influence UX and adapter selection, not authentication or active transfer state.
+
+## Completion Criteria
+
+- An independently audited RFC-conformant Rust PAKE implementation and dependency tree and specialist exporter invocation and SPAKE2 AAD composition review clear the release gate, or the gap remains explicitly release-blocking.
+- RFC 9382, invalid-point, confirmation, exporter, split-MITM, reconnect, concurrency, and one-use ceremony tests are reproducible.
+- JSON and frame behavior has reproducible golden and malformed-input vectors.
+- TCP splitting/coalescing and backpressure behavior is demonstrated under faults.
+- Filesystem behavior supports the required fail-fast multi-file semantics on target platforms.
+- mDNS limitations and direct-address behavior are documented from real systems.

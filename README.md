@@ -1,141 +1,76 @@
 # Lanweave
 
-> **Lanweave: A Secure Local Peer-to-Peer File Transfer Protocol**
+Lanweave is a planned local peer-to-peer file transfer protocol and Rust CLI. This repository currently contains documentation only: there is no working discovery, networking, security, CLI, or transfer implementation yet.
 
-Lanweave is a secure, open protocol and Rust CLI for peer-to-peer file exchange between devices on the same local network.
+The first release is intentionally narrow. It will transfer an explicitly approved, ordered manifest of regular files over one TCP/TLS connection, using JSON control frames and raw binary `DATA` frames.
 
-Lanweave is currently in the **design and research phase**. No discovery, networking, cryptography, command-line, or file-transfer functionality has been implemented.
+## Intended Flow
 
-## Why Lanweave
+1. The receiver begins a pairing ceremony, generates a uniform CSPRNG 8-digit decimal code, and shares it privately out of band. The leading-zero-preserving code is memory-only, one-use, expires after 120 seconds on a monotonic clock, and permits five failed sender-confirmation verifications total across reconnects. Bounded in-flight pairing states and separate connection, source, and CPU rate limits constrain work that never reaches that verification.
+2. The sender finds the receiver through mDNS/DNS-SD or supplies its address directly. The peers open TLS 1.3 using an ephemeral identity generated for that connection, then exchange `hello`. Experimental protocol version `1` and the security profile are fixed rather than negotiated.
+3. The peers run RFC 9382 SPAKE2-P256-SHA256-HKDF-HMAC, with the sender as A and receiver as B. Four `pairing` records carry the sender share, receiver share, sender confirmation, and receiver confirmation. The specified SPAKE2 AAD for confirmation-key derivation contains the 32-byte TLS exporter and both exact `hello` JSON body byte strings, excluding frame headers; these values are not inserted into RFC 9382 transcript `TT`. The ceremony becomes sender-confirmed when the receiver verifies the sender confirmation, while mutual pairing requires the receiver confirmation to be flushed to TLS and verified by the sender.
+4. Only after pairing succeeds, the sender sends one `transfer_request` containing the complete immutable manifest of 1..N selected regular files.
+5. The receiver separately reviews that exact whole manifest and prepares the destination before sending `transfer_response`. Preparation failure rejects the request; an accepting response is sent only after preparation succeeds. Pairing never approves unseen files. There is no later metadata phase and no partial-manifest approval.
+6. After the accepted response, the receiver sends `ready`, then files are sent sequentially as raw binary `DATA` frames. An uninterrupted file is followed by `file_end` and at most one `file_result`.
+7. A successful file is verified and finalized before the next file starts. On the first failure, the current partial file is deleted, the already verified prefix is kept, and the transfer stops.
 
-The problem I want to solve is ordinary: two computers are on the same network, and a person wants to move a file between them without first uploading it somewhere else. That should not require a cloud account, a central Lanweave server, or a closed protocol.
+Duplicate names, platform-equivalent names, and names that already exist in the destination are rejected. Version 1 does not negotiate overwrite or rename behavior.
 
-Lanweave's answer is an open protocol and a small Rust CLI. Peers find each other with mDNS/DNS-SD, the receiver chooses whether to accept a request, and a short-lived token ties that decision to the session. Files only move after the session has been authenticated and encrypted, and the receiver checks what it wrote before reporting success.
+## MVP Boundary
 
-## Intended flow
+The MVP release requires multi-file transfer. A one-file path is only an internal vertical slice used to prove the framing, storage, and state-machine path; it is not a releasable MVP by itself.
 
-1. Devices advertise `_lanweave._tcp.local.` and browse for peers.
-2. A sender selects a receiver and files, then sends metadata-only summary information.
-3. The receiver accepts or rejects the request.
-4. On acceptance, the receiver displays a one-time, short-lived token.
-5. The sender enters that token; the peers bind approval, token verification, identities, negotiated version, and key exchange to one session transcript.
-6. Only after the secure session is confirmed are full metadata and file chunks sent.
-7. The receiver writes to temporary files, verifies SHA-256, atomically finalizes them, and both peers report completion or failure.
+The version 1 message vocabulary is deliberately small:
 
-The token authorizes a human-observed pairing. It is never used directly as a file-encryption key.
+- JSON control frames: `hello`, `pairing`, `transfer_request`, `transfer_response`, `ready`, `file_end`, `file_result`, `cancel`, and `error`.
+- Binary frame: `DATA`, whose payload is uninterpreted file bytes.
 
-## Goals
+There is no CBOR, capability negotiation, second metadata phase, application ACK window, transfer-complete message, or close handshake. TCP supplies reliable ordered delivery. The selected pairing profile uses the live connection's exporter and exact `hello` JSON bodies in SPAKE2 AAD for confirmation-key derivation, not in `TT`; TLS remains the sole record-protection layer.
 
-- Local-first, serverless operation on ordinary Wi-Fi and Ethernet.
-- Explicit receiver consent and secure-by-default transfers.
-- An open, extensible, implementation-independent Lanweave Protocol.
-- Interoperability across desktop platforms.
-- Bounded memory, disk, CPU, and network resource use.
-- A clear Rust CLI reference implementation with separable protocol, discovery, transport, crypto, transfer, and UI layers.
+## Deferred Scope
 
-## Non-goals for the initial version
+Directories, resume, parallelism, compression, overwrite or rename negotiation, trusted devices, algorithm agility, QUIC, mobile clients, and graphical interfaces are outside the MVP.
 
-Trusted-device auto-acceptance, resumable transfers, folder synchronization, clipboard sharing, Android, graphical applications, internet relays, group transfer, Wi-Fi Direct, and Bluetooth-assisted discovery are future possibilities, not initial commitments. Lanweave is not a general remote filesystem or anonymity system and cannot protect a device already compromised by local malware.
+## Initial Implementation Shape
 
-## Where the design stands
-
-I have made enough working choices to guide the first implementation, but several of them still need prototypes or security review:
-
-- mDNS/DNS-SD discovery using `_lanweave._tcp.local.`.
-- TCP for the first transport profile, with TLS 1.3 preferred for early channel confidentiality; QUIC remains a later candidate.
-- CBOR with deterministic/canonical encoding rules and explicit length-delimited framing.
-- Persistent Ed25519 device identity; X25519 ephemeral agreement; HKDF-SHA256; ChaCha20-Poly1305; SHA-256 file hashes.
-- Receiver-generated one-time token, upgraded to a reviewed proof/PAKE construction before a security-stable release.
-
-The exact binding between the human token, TLS, device identity, and the Lanweave transcript is **Needs Research** and must receive specialist review. See [cryptography](docs/CRYPTOGRAPHY.md) and [decision records](docs/DESIGN_DECISIONS.md).
-
-## Architectural outline
-
-```mermaid
-flowchart TB
-    CLI[CLI interface] --> APP[Application orchestration]
-    APP --> SM[Transfer state machines]
-    SM --> SESSION[Session management]
-    SESSION --> MSG[Lanweave protocol messages]
-    MSG --> FRAME[Serialization and framing]
-    SESSION --> CRYPTO[Cryptographic session layer]
-    FRAME --> TRANSPORT[Transport abstraction]
-    CRYPTO --> TRANSPORT
-    APP --> DISCOVERY[mDNS / DNS-SD discovery]
-    DISCOVERY --> OS[OS networking]
-    TRANSPORT --> OS
-    OS --> LAN[Wi-Fi or Ethernet]
-```
-
-Expected future repository structure:
-
-```text
-crates/
-├── lanweave-protocol
-├── lanweave-discovery
-├── lanweave-transport
-├── lanweave-crypto
-├── lanweave-transfer
-├── lanweave-core
-└── lanweave-cli
-docs/
-```
-
-The initial implementation may combine internal crates until their interfaces stabilize. See [Architecture](docs/ARCHITECTURE.md).
-
-## Proposed CLI interface
-
-These commands illustrate a future interface; they do not exist yet.
-
-```bash
-lanweave discover
-lanweave send report.pdf
-lanweave receive
-lanweave identity
-```
+The initial Rust implementation will be one binary crate with internal modules for the CLI, orchestration, protocol/state validation, JSON and frame parsing, transport, pairing, discovery, and filesystem transfer. It should use a small pairing-library adapter and a ceremony manager rather than implement group arithmetic. Preferred dependency families are `rustls` 0.23, `tokio-rustls` 0.26, `rcgen` 0.14, and `zeroize`. An interoperability prototype may also expose the full candidate surface of `pakery-spake2`, `pakery-core`, and `pakery-crypto` with its `p256` and `spake2` features; this surface is candidate-only, and returned `Ke`/`session_key` material must be discarded after confirmation. Crates will be split only after a concrete reuse or isolation need appears.
 
 ## Documentation
 
 | Document | Purpose |
 | --- | --- |
-| [Project overview](docs/PROJECT_OVERVIEW.md) | Scope, users, assumptions, goals, and principles |
-| [Protocol specification](docs/PROTOCOL.md) | Normative phases, invariants, limits, and failure behavior |
-| [Message format](docs/MESSAGE_FORMAT.md) | Typed messages, identifiers, serialization, and framing |
-| [Architecture](docs/ARCHITECTURE.md) | Layers, separation rules, and proposed Rust workspace |
-| [State machines](docs/STATE_MACHINES.md) | Valid states, events, transitions, and recovery |
-| [Sequence diagrams](docs/SEQUENCE_DIAGRAMS.md) | Successful and failure message flows |
-| [Discovery](docs/DISCOVERY.md) | mDNS/DNS-SD advertisement and privacy |
-| [Transport](docs/TRANSPORT.md) | TCP/TLS and QUIC comparison and byte flow |
-| [Cryptography](docs/CRYPTOGRAPHY.md) | Primitive roles and unresolved handshake binding |
-| [Security](docs/SECURITY.md) | Objectives, boundaries, and safe handling requirements |
-| [Threat model](docs/THREAT_MODEL.md) | Structured threats, mitigations, and residual risk |
-| [File transfer](docs/FILE_TRANSFER.md) | Streaming, flow control, hashing, and safe finalization |
-| [Error handling](docs/ERROR_HANDLING.md) | Error taxonomy, wire codes, and state effects |
-| [Versioning](docs/VERSIONING.md) | Compatibility and schema evolution |
-| [Design decisions](docs/DESIGN_DECISIONS.md) | Accepted, proposed, deferred, and research decisions |
-| [Research plan](docs/RESEARCH_PLAN.md) | First-week evidence-gathering plan |
-| [Testing strategy](docs/TESTING_STRATEGY.md) | Test layers, invariants, fuzzing, and compatibility |
-| [Implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md) | Documentation-only two-month implementation plan |
-| [Glossary](docs/GLOSSARY.md) | Canonical terminology |
+| [Project overview](docs/PROJECT_OVERVIEW.md) | MVP scope, internal vertical slice, invariants, and non-goals |
+| [Protocol](docs/PROTOCOL.md) | Normative version 1 sequence, admission rules, limits, and failure behavior |
+| [Message format](docs/MESSAGE_FORMAT.md) | Strict JSON messages, raw `DATA`, and fixed stream framing |
+| [State machines](docs/STATE_MACHINES.md) | Sender and receiver states and shared invariants |
+| [Sequence diagrams](docs/SEQUENCE_DIAGRAMS.md) | Successful, rejected, failed, and cancelled exchanges |
+| [File transfer](docs/FILE_TRANSFER.md) | Manifest, destination, streaming, verification, and cleanup rules |
+| [Transport](docs/TRANSPORT.md) | Single-connection TCP/TLS behavior and backpressure |
+| [Cryptography](docs/CRYPTOGRAPHY.md) | Selected pairing profile and TLS-binding requirements |
+| [Security](docs/SECURITY.md) | Security objectives, boundaries, and implementation requirements |
+| [Threat model](docs/THREAT_MODEL.md) | Threats, mitigations, residual risks, and review gates |
+| [Error handling](docs/ERROR_HANDLING.md) | Terminal errors, file failures, cancellation, and cleanup |
+| [Versioning](docs/VERSIONING.md) | Exact version 1 and strict schema compatibility |
+| [Design decisions](docs/DESIGN_DECISIONS.md) | Compact accepted, research, and deferred decision log |
+| [Implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md) | Dependency gates from framing through release |
+| [Architecture](docs/ARCHITECTURE.md) | One-crate module boundaries, data flow, and concurrency rules |
+| [Research plan](docs/RESEARCH_PLAN.md) | Security review and focused feasibility prototypes |
+| [Testing strategy](docs/TESTING_STRATEGY.md) | Wire, state, filesystem, fuzz, and security-profile tests |
+| [Discovery](docs/DISCOVERY.md) | Minimal untrusted mDNS hints and direct-address fallback |
+| [Glossary](docs/GLOSSARY.md) | Canonical version 1 terminology |
 
-## Development phases
+## Development Status
 
-The order of work is intentional. I will settle the wire format and state machines first, then discovery and identity, then the request and pairing flow. File transfer comes after those pieces can establish a session I am prepared to trust.
+The project is in protocol consolidation and research. Work should proceed by dependency gates: wire/framing, local multi-file transfer, TCP/TLS transport, audited pairing implementation, discovery, then hardening and release. No implementation milestone has been completed.
 
-The first real milestone is one dependable file transfer. Multi-file support and packaging come later, and they should be cut before the single-file path is rushed.
+## Security Status
 
-## Security status
+Lanweave has not been implemented, audited, or shown safe for sensitive data. `Provisional TLS` names only the prepairing connection. After mutual confirmation the connection is pairing-authenticated, but the protocol and implementation remain experimental and unsafe for sensitive use until audit.
 
-> **Experimental design:** Lanweave has not received a security audit. The specification contains unresolved security-sensitive choices. Future builds must not be represented as production-secure until the handshake, token verification, parsers, key storage, and filesystem behavior have been reviewed and tested.
+Release blockers include specialist review of the application-specific password-to-scalar mapping; audit of the complete implementation dependency tree, including the candidate `pakery-spake2`/`pakery-core`/`pakery-crypto` surface; review of the exporter invocation and SPAKE2 AAD composition; exact `rustls` certificate-verifier behavior; and deterministic RFC, profile, interoperability, and adversarial vectors. No current PAKE crate is approved: `pakery-spake2` 0.2.1 is a very new, unaudited interoperability-prototype candidate only, while RustCrypto `spake2` targets an old draft, is unaudited, and is probably not constant-time. No sensitive release may proceed until every gate clears.
 
-Do not use early prototypes for sensitive data. Report suspected vulnerabilities privately through a future security policy rather than a public issue.
+## Contributing And Licence
 
-## Contributing
+Design feedback is welcome, especially when it identifies a violated invariant or provides reproducible evidence. Code contribution guidance will be established when implementation starts.
 
-Design changes are welcome, especially when they come with testable reasoning. Please say which assumptions you are changing and update the affected messages, states, diagrams, compatibility rules, and threats together.
-
-Cryptographic changes need more than a plausible sketch: point to a reviewed construction and expect specialist review. Code contributions will make sense once the workspace exists; at the moment, the repository is still working through the design.
-
-## Licence
-
-I have not chosen the final licences yet. Before accepting contributions or publishing a release, I will select an OSI-approved source licence, decide how the specification and documentation are licensed, and publish a contributor policy.
+No project licence has been selected. The source and documentation must not be described as legally open or reusable until licence terms are published; contribution and security-reporting policies are also still pending.

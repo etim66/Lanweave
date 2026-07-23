@@ -1,85 +1,46 @@
 # Discovery
 
-## Role of mDNS and DNS-SD
+## Purpose And Trust
 
-Lanweave uses mDNS to find records on the local link and DNS-SD to describe the service behind those records. In practice, DNS-SD provides PTR, SRV, TXT, and address records without asking the user to configure a DNS server.
+Lanweave uses mDNS/DNS-SD as an optional convenience for finding candidate endpoints on the local link. An advertisement answers only “where might a version 1 Lanweave listener be?” It does not prove identity, consent, pairing, availability, or safety.
 
-The service type for the initial TCP profile is:
+Discovery is not part of the active transfer state. Once a TCP/TLS connection is selected, an advertisement changing, expiring, or disappearing has no effect on that connection or its transfer.
+
+## Service Record
+
+The proposed service type is:
 
 ```text
 _lanweave._tcp.local.
 ```
 
-An advertisement answers “where might a compatible instance be listening?” It never proves device identity, consent, availability, or safety.
+SRV supplies the host and port. TXT contains at most this hint:
 
-## Proposed advertisement
-
-The service instance label is there for local browsing. It should be readable and allowed to change when there is a naming collision; it is not the device's identity.
-
-The SRV record already carries the target host and listening port. I therefore do not plan to repeat the port in TXT, even though the table records that option for completeness.
-
-| TXT key | Proposed encoding | Status | Privacy/security analysis |
-| --- | --- | --- | --- |
-| `id` | Truncated/encoded device ID, or omit | Needs Research | Stable IDs enable cross-session tracking. Prefer an ephemeral discovery pseudonym and reveal persistent ID after connect. |
-| `inst` | Instance ID, compact ASCII | Proposed | Enables local self-filtering/restart distinction but tracks one process lifetime. |
-| `v` | Supported major and minor range, e.g. `1.0-1.0` | Proposed | Reveals protocol generation; enables filtering but remains untrusted. |
-| `port` | Decimal port | Rejected duplication | SRV already carries it; conflicting values create ambiguity. |
-| `name` | UTF-8 device display name | Deferred/default omit | Useful UX but can reveal a real name, host purpose, or terminal-control text. Service instance label may already expose a name. |
-| `platform` | Coarse value or omit | Default omit | Helps diagnostics but fingerprints OS and attack surface. Negotiate after connection if needed. |
-| `cap` | Compact non-sensitive discovery capabilities | Proposed minimal | Advertise only connection-relevant hints; detailed capabilities enable fingerprinting and remain untrusted. |
-| `fp` | Encoded public-key fingerprint | Needs Research/default omit | Supports early continuity but is stable tracking metadata. Prefer disclosure on connection unless threat review favors it. |
-| `app` | Application version | Default omit | Useful debugging, but advertises patch level/vulnerabilities. Protocol version is sufficient for discovery. |
-
-TXT records have practical size and interoperability constraints. Keep the total comfortably below a single typical DNS packet, use ASCII keys, define exact encodings later, and treat all values as hostile. The normative listening port comes from SRV.
-
-## Lifecycle
-
-1. Generate a new random instance ID at process start.
-2. Listen successfully before registering the service.
-3. Register one service instance per logical listener, with conflict-renaming handled by the platform.
-4. Browse for `_lanweave._tcp.local.` continuously while discovery is enabled.
-5. Resolve PTR → SRV/TXT → A/AAAA and retain multiple scoped candidate addresses.
-6. Filter the local instance by instance ID plus local listener/address checks; never filter solely by display name.
-7. Emit added/updated/removed events to application orchestration.
-8. Refresh TTLs; expire stale entries after the advertised TTL or recommended 120 seconds.
-9. On graceful exit, deregister/send goodbye. Consumers must still tolerate crashes and stale caches.
-
-## Address handling
-
-- Keep both IPv4 and IPv6; do not convert addresses to identity.
-- Preserve IPv6 scope/interface IDs for link-local addresses.
-- Try candidates with bounded “happy eyeballs”-style racing or ordered fallback, avoiding connection storms.
-- A device on multiple interfaces may appear multiple times. Deduplicate provisionally by instance ID, then by authenticated device identity after connection.
-- Do not bridge advertisements across interfaces by default. Respect OS routing and administrator policy.
-- Hostname and address changes update the candidate; they do not change authenticated identity.
-- Duplicate service names are normal and automatically suffixed; UI should show enough non-sensitive context to distinguish candidates.
-
-## Failure realities
-
-Discovery will fail on some perfectly healthy networks. A firewall may block inbound TCP or UDP 5353, guest Wi-Fi often isolates clients, and some access points suppress multicast. VPN and container interfaces can also make the same machine appear more than once.
-
-Those are availability problems, not authentication failures. The CLI should tell the difference between “nothing was advertised,” “the service resolved but the connection failed,” and “a peer connected but rejected the protocol.”
-
-Future Android work must verify multicast locks, background execution, battery policy, and OEM restrictions. Mobile behavior must not be inferred from desktop success.
-
-## Alternatives
-
-| Mechanism | Advantages | Limitations / role |
+| Key | Value | Meaning |
 | --- | --- | --- |
-| mDNS/DNS-SD | Standard local service discovery, IPv4/IPv6, mature OS integration | Multicast/client isolation, metadata leakage, platform differences |
-| SSDP | Widely seen in consumer networks | HTTP-like discovery semantics, noisy ecosystem, weaker service typing |
-| Direct IP entry | Works without multicast and is simple fallback | Poor UX, changing/scoped IPv6 addresses, still needs authentication |
-| UDP broadcast | Simple on IPv4 | Not IPv6-native, subnet-limited, custom discovery protocol/firewall issues |
-| Wi-Fi Direct | Can work without shared AP | Complex platform-specific group creation; future transport topology |
-| Bluetooth discovery | Useful proximity hint | Permissions, bandwidth, platform complexity; future assisted discovery only |
-| Central rendezvous | Cross-subnet/internet reachability | Violates no-mandatory-server goal; privacy/operation burden |
+| `v` | `1` | Untrusted hint that the listener expects experimental protocol version `1` |
 
-For version 1.0, I plan to use mDNS/DNS-SD and keep direct address entry as a later fallback. I will advertise as little as practical and verify every useful claim again after connecting.
+There are no discovery capabilities, identity fingerprints, platform values, application versions, transfer state, file metadata, display names, pairing codes, or pairing-ceremony state in TXT. Pairing codes and ceremony state MUST NOT appear in any PTR, SRV, TXT, service-instance label, host label, or other discovery field. Service-instance and host labels remain untrusted and must be safely rendered.
 
-This remains a proposed decision until the platform tests are complete. The relevant attacks and privacy costs are covered in the [Threat Model](THREAT_MODEL.md).
+## Behavior
 
-## Verification questions
+1. Start the TCP listener before advertising it.
+2. Register `_lanweave._tcp.local.` and browse while discovery is enabled.
+3. Resolve PTR, SRV, optional TXT, and A/AAAA records into bounded candidate endpoints.
+4. Preserve interface scope for link-local IPv6 addresses and retain both IPv4 and IPv6 candidates.
+5. Treat duplicates, conflicts, updates, stale records, and goodbye records as ordinary discovery events.
+6. Stop discovery independently of any active connection.
 
-I still need real results for the Rust libraries, Windows firewall prompts, macOS registration, Linux daemon dependencies, interface selection, TXT record size, and scoped IPv6 addresses.
+Implementations must bound record counts, text lengths, retained candidates, resolution work, and connection attempts. Record values are hostile input. Addresses are routing information, not peer identity.
 
-That work is scheduled in the [Research Plan](RESEARCH_PLAN.md); until it is done, the discovery decision stays proposed.
+## Direct-Address Fallback
+
+A user-supplied host or IP address and port bypasses mDNS but not provisional TLS, `hello`, pairing, or any security check. Direct-address connections MUST pair first, then send `transfer_request`, then obtain separate exact-manifest approval and prepare the destination before an accepting `transfer_response`; acceptance is followed by `ready`. They MUST NOT disclose names, sizes, or file counts before pairing. Provisional certificate acceptance still requires strict certificate structure and signature validation, including TLS 1.3 `CertificateVerify`. This fallback is required because multicast may be blocked by firewalls, guest networks, VPNs, client isolation, or platform policy.
+
+## Failure And Security
+
+Spoofed discovery can hide a peer, create noise, or direct a connection to an attacker. The fixed experimental, unaudited, release-blocked pairing profile is intended to prevent that provisional endpoint from becoming the paired peer without the receiver-generated out-of-band string; it is not yet a production assurance claim. Because pairing precedes `transfer_request`, a spoofed provisional endpoint does not receive manifest names or sizes. Discovery code must report "not found," resolution failure, connection failure, and protocol/pairing rejection as distinct outcomes without exposing cryptographic failure details. Within pairing, malformed messages or points use `invalid_message`, while an unavailable ceremony may fail before the receiver share and uses the same `authentication_failed` code as a valid correctly ordered sender-confirmation failure when a response is safe. This shared code does not guarantee equal phase or timing and does not claim to hide ceremony existence.
+
+Discovery is not private. Other LAN devices can observe service presence and advertised endpoints even when they cannot authenticate as a peer; once a connection begins they can also observe timing and traffic volume, capture or drop ciphertext, and cause denial of service.
+
+Platform prototypes must verify registration APIs, firewall behavior, multi-interface handling, scoped IPv6, conflict renaming, TTL expiry, and multicast-disabled operation. Until those tests pass, mDNS library and adapter choices remain implementation research rather than protocol commitments.
