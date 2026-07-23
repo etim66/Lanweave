@@ -2,82 +2,96 @@
 
 ## Initial Shape
 
-The initial implementation is one Rust binary crate. Internal modules provide boundaries without freezing public crate APIs:
+The first implementation is one Rust binary crate. Modules create clear internal boundaries without committing to public crate APIs.
 
 ```text
-main / CLI
-    application orchestration and transfer state
-        ceremony manager
-        protocol values and validation
-        small pairing-library adapter
-        transfer and filesystem safety
-    discovery adapter
-    framed TCP/TLS adapter
-        JSON codec and frame parser
+main
+  app event loop
+    tui
+    discovery
+    session
+      protocol and framing
+      transport and pairing
+      transfer and storage
 ```
 
-Suggested module names are descriptive, not promises of public APIs: `cli`, `app`, `ceremony`, `protocol`, `framing`, `transport`, `pairing`, `transfer`, `storage`, and `discovery`. Preferred implementation families are `rustls` 0.23, `tokio-rustls` 0.26, `rcgen` 0.14, and `zeroize`.
+Suggested module names are `tui`, `app`, `command`, `discovery`, `session`, `protocol`, `framing`, `transport`, `pairing`, `transfer`, and `storage`.
 
-Do not split crates prematurely. A module becomes a separate crate only when actual reuse, platform isolation, independent fuzzing, or dependency enforcement justifies the cost.
+Keep one crate until reuse, platform isolation, dependency control, or independent fuzzing gives a clear reason to split it.
+
+## Application Event Loop
+
+The application loop owns the user-visible state. It receives bounded events from:
+
+- terminal input and resize events;
+- discovery updates;
+- pairing and session tasks;
+- transfer progress and results; and
+- shutdown signals.
+
+The loop updates a plain application model and asks the TUI to render it. Network and disk tasks never write directly to the terminal. The TUI never blocks a network task while waiting for user input.
+
+`/` opens a command list built from one command registry. The registry supplies command names, help text, and the states in which each command is available. Typed commands and buttons dispatch the same application actions.
 
 ## Dependency Direction
 
-Policy and domain rules stay inward; operating-system and library details stay at adapters.
-
 ```text
-CLI ---------> application/state <--------- discovery adapter
-                       |
-                       +--> ceremony manager
-                       +--> protocol/validation
-                       +--> transfer policy <--------- filesystem adapter
-                       +--> pairing adapter <--------- audited RFC 9382 library
-                       +--> framed connection <------- TCP/TLS + JSON adapters
+TUI ----------> app/state <---------- discovery adapter
+                    |
+                    +--> session state
+                    +--> protocol validation
+                    +--> transfer policy <------ filesystem adapter
+                    +--> pairing adapter <------ reviewed PAKE library
+                    +--> framed connection <---- TCP/TLS adapter
 ```
 
-- The ceremony manager outlives individual connections. It owns only memory-resident code state and atomically checks the 120-second monotonic deadline, a budget of five failed sender-confirmation verifications across reconnects, cancellation, and one-use state. Bounded in-flight PAKE states plus independent connection, source, and CPU rate limits constrain work before verification admission.
-- Successful sender-confirmation verification moves a ceremony to `sender-confirmed`, not mutually paired. The receiver becomes paired only after its receiver confirmation (`cB`) is committed and flushed to TLS; the sender becomes paired only after its sender confirmation (`cA`) is committed and it verifies `cB`. Concurrent sender confirmations race through one atomic transition; all losers fail closed.
-- The application state machine owns post-pairing consent, the immutable manifest, active-file order, and terminal outcome. Pairing success cannot create manifest approval.
-- Protocol validation does not depend on CLI, sockets, mDNS, or filesystem APIs.
-- Discovery only emits untrusted candidate endpoints; it is not part of an active connection's state.
-- Transport carries bounded frames and reports I/O events; it does not infer approval or file success.
-- Storage maps the locally approved manifest into a receiver-selected directory, prepares it before wire acceptance, and never invents overwrite or rename policy.
-- The pairing adapter exposes RFC 9382 message and confirmation operations without exposing or implementing group arithmetic. It uses exact identities `lanweave-v1-sender` and `lanweave-v1-receiver`; the exporter and exact sender/receiver `hello` JSON body bytes, excluding frame headers, enter the specified SPAKE2 AAD for confirmation-key derivation and do not enter RFC transcript `TT`.
-- A prototype adapter may depend on candidate-only `pakery-spake2`, `pakery-core`, and `pakery-crypto` with its `p256` and `spake2` features. It must discard returned `Ke`/`session_key` after confirmation rather than expose either to transport or transfer code.
-- Transport permits only TLS 1.3 and creates an ephemeral certificate/key for each connection. The ephemeral identity is not a persistent or independently trusted device identity. Demonstrating erasure of every transport private-key representation and library copy is a review gate, not an assumed property.
+- The TUI renders state and sends user actions. It does not contain protocol rules.
+- Discovery emits untrusted device candidates. It starts and stops with the app.
+- Session state owns pairing, authorization, one active transfer, and the idle timer.
+- Protocol validation has no dependency on the TUI, sockets, mDNS, or filesystem APIs.
+- Transport carries bounded frames and reports events. It does not decide user consent.
+- Storage validates names, creates temporary files, and never invents overwrite or rename behavior.
+- The pairing adapter wraps a reviewed library. Lanweave does not implement group arithmetic.
 
-## Wire Layers
+## Session Ownership
 
-Control and data share one ordered frame stream but have distinct payload formats:
+One task owns each connection and its mutable session state. Reader, writer, file I/O, and timer tasks communicate with that owner through bounded channels.
 
-```text
-control value -> strict JSON bytes ----+
-                                      +-> frame header {kind, length} -> TLS records -> TCP
-file bytes ----------------> DATA -----+
-```
+The owner enforces these rules:
 
-Inbound processing reverses the layers:
+- pairing must finish before the session becomes active;
+- only one transfer request or transfer is active at a time;
+- either participant can become the requester for the next transfer;
+- transfer completion or rejection returns to session idle;
+- transfer rejection returns to idle, while failure or cancellation after `ready` cleans the transfer and closes the session;
+- protocol, authentication, and transport failures close the session;
+- `session_close` or 600 seconds of idle time closes the session; and
+- closing drops all temporary authorization and requires fresh pairing next time.
 
-```text
-TCP -> TLS -> bounded frame parser -> control: strict JSON -> semantic/state validation
-                                  +-> DATA: raw bytes ---> active-file writer
-```
+A single writer serializes complete frames. Bounded channels carry backpressure to file readers. Blocking filesystem work runs outside async network tasks.
 
-The frame kind determines whether a payload is JSON control data or raw `DATA`. JSON is never used to carry file bytes. TLS is the sole record-protection layer; the live TLS exporter and exact `hello` JSON bodies are inputs to the specified SPAKE2 AAD and confirmation-key derivation before the manifest is sent, not additions to `TT`. Exact manifest approval is a later, separate state transition.
+## Discovery Lifecycle
 
-## Connection And Transfer Ownership
+App startup creates the listener before advertising it. Browsing and advertising remain active while the TUI runs. App shutdown stops advertisements, browsing, listeners, connections, and temporary session state in that order where practical.
 
-After mutual pairing, that connection owns exactly one transfer. One application task owns mutable transfer state, including the manifest index and current temporary file. Socket readers, the single frame writer, and file I/O workers communicate with that owner through bounded channels. Disconnecting before sender confirmation does not reset the ceremony deadline or failed-verification count; disconnecting after sender-confirmed does not make the code reusable, even if `cB` is lost and mutual pairing never completes.
+An active session does not depend on its discovery record. If discovery changes or disappears after connection, the session continues.
 
-Cancelling a ceremony cancels every active PAKE state attached to it. On any ceremony consumption or terminal transition, the manager and connection tasks perform best-effort zeroization of the code, password scalar, ephemeral scalars, confirmation keys, exporter copy, and any candidate-library `Ke`/`session_key`, including states waiting to enter serialized sender-confirmation verification. Cancellation and zeroization are idempotent; no dummy PAKE is started for unavailable ceremonies.
+## Pairing Roles And Transfer Roles
 
-Bounded channels provide backpressure and memory limits. A single writer serializes complete frames so control and `DATA` bytes cannot interleave and preserves FIFO order through each `file_end`. A terminal control may bypass only after queued nonterminal frames are discarded. File I/O may use blocking workers where required, but the network task must not block on disk or terminal input.
+Pairing roles do not change during one session:
 
-No application ACK window is needed: TCP supplies reliable ordering, while `file_result` reports the semantic result after receiver verification. Cancellation is idempotent and causes the current partial to be removed. On any file failure, later manifest entries are never opened.
+- the **initiator** selects a device, sends `pair_request`, and enters the code;
+- the **responder** accepts the request and displays the locally generated code.
 
-The connection sequence is TLS 1.3, `hello`, four `pairing` records, `transfer_request`, separate receiver review and destination preparation, accepting or rejecting `transfer_response`, then `ready` and `DATA` after acceptance. The records are sender A share, receiver B share, sender A confirmation, and receiver B confirmation. No manifest bytes are sent before mutual pairing confirmation, no accepting response is sent before preparation succeeds, and no file bytes are sent before exact manifest approval.
+Transfer roles can change for every request:
+
+- the **requester** proposes files and sends accepted file bytes;
+- the **recipient** reviews metadata and saves accepted files.
+
+Do not use `sender` and `receiver` as session-wide identities.
 
 ## Filesystem Boundary
 
-Before an accepting `transfer_response`, storage planning validates every manifest entry against the target platform and selected destination and prepares the resources needed to receive manifest index 0. Unsafe names, duplicate names, platform-equivalent names, existing destination entries, or preparation failure reject the whole request.
+Before accepting a transfer, storage validates every filename against the destination platform, checks conflicts, confirms resource policy, and prepares the first temporary file. Unsafe, duplicate, equivalent, existing, or unpreparable names reject the whole request.
 
-Each file is written to a non-final temporary entry. Only exact length and digest verification permit safe finalization. Once finalized, that file joins the verified prefix. A later failure does not remove that prefix and must remove the current partial.
+Incoming data is written only to the current temporary file. Exact size and digest verification are required before safe no-overwrite finalization. A later failure keeps the verified prefix and removes the current partial file.

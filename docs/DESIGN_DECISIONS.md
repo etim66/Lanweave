@@ -1,27 +1,23 @@
 # Design Decisions
 
-Statuses are **Accepted**, **Research Gate**, and **Deferred**. Accepted decisions define the current experimental version 1 baseline. A Research Gate must be resolved by evidence and specialist review before release.
-
-| ID | Status | Decision | Rationale |
+| ID | Status | Decision | Reason |
 | --- | --- | --- | --- |
-| DD-001 | Accepted | Control payloads are JSON; file bytes use raw binary `DATA` frames. | JSON is inspectable and interoperable, while raw data avoids binary encoding overhead. Strict limits and duplicate-key rejection handle JSON ambiguity. |
-| DD-002 | Accepted | One successful ceremony admits one TLS 1.3 connection and one transfer; each connection uses a fresh ephemeral identity. | One ordered stream keeps correlation and shutdown small. An ephemeral certificate/key avoids claiming a persistent device identity before code-authenticated pairing. |
-| DD-003 | Accepted | Pairing completes before the sender discloses `transfer_request`; the receiver then separately reviews one immutable ordered manifest of 1..N regular files and prepares the destination before sending an accepting `transfer_response`. | Pairing authenticates the live connection, not unseen files. Consent must cover all names, exact sizes, and order, and preparation failure must reject rather than follow acceptance. |
-| DD-004 | Accepted | Files transfer sequentially with `DATA`, `file_end`, and per-file `file_result`. | Sequential processing bounds resources and gives an explicit verification boundary for every file. TCP ordering removes the need for application ACK windows. |
-| DD-005 | Accepted | Stop on the first file failure, delete the current partial file, and retain the verified prefix. | Ordinary filesystems cannot provide portable whole-manifest atomicity. This rule is deterministic and never exposes the failed partial as complete. |
-| DD-006 | Accepted | Duplicate, platform-equivalent, unsafe, existing, and unpreparable destination names or resources are rejected before an accepting `transfer_response`. | Version 1 avoids overwrite/rename races and ensures the locally approved manifest maps uniquely into a prepared destination before wire acceptance. |
-| DD-007 | Accepted | Experimental protocol version is exactly `1`, with fixed RFC 9382 SPAKE2-P256-SHA256-HKDF-HMAC, sender A, receiver B, the specified exporter invocation and SPAKE2 AAD composition for confirmation-key derivation, mutual confirmation, and no capability negotiation. | The AAD contains the exporter and exact `hello` JSON bodies without frame headers; it is separate from RFC transcript `TT`. A strict profile reduces downgrade and interoperability states. |
-| DD-008 | Accepted | The implementation starts as one binary crate with a small pairing adapter and ceremony manager; it does not implement group arithmetic. | Public crate boundaries should follow demonstrated need, and PAKE arithmetic must come from an independently audited RFC-conformant implementation. |
-| DD-009 | Accepted | mDNS/DNS-SD is an optional, untrusted discovery convenience; direct address is the fallback. | Discovery improves local UX but may fail or be forged and must not participate in authentication or active transfer state. |
-| DD-010 | Research Gate | Validate an independently audited RFC-conformant Rust PAKE implementation and dependency tree and obtain specialist review of the exporter invocation and SPAKE2 AAD composition. | The profile is selected and the exporter uses label `EXPORTER-Channel-Binding`, 32 output bytes, and no context, but password mapping, implementation audit quality, AAD composition, split-MITM resistance, certificate verification, and confirmation behavior remain release-critical evidence gaps. |
-| DD-011 | Accepted | The receiver generates a uniform CSPRNG 8-digit decimal code for a memory-only, one-use ceremony with a 120-second monotonic deadline and at most five failed sender-confirmation verifications across reconnects. | Leading zeros, atomic verification admission/accounting, expiry, and one-use state are precise. Bounded in-flight PAKE states and connection/source/CPU rate limits separately constrain malformed or incomplete work. |
+| DD-001 | Accepted | `lanweave` opens a persistent TUI. | Discovery, incoming requests, and repeat transfers require a running app. |
+| DD-002 | Accepted | Entering `/` shows commands available in the current state. | Users can discover actions without memorizing flags. |
+| DD-003 | Accepted | Discovery and advertising run only while the app runs. | A listed device must be available to receive a request. |
+| DD-004 | Accepted | The initiator selects a device; the responder accepts or rejects before a code is created. | This matches the visible user flow and avoids unsolicited code ceremonies. |
+| DD-005 | Accepted | The responder creates and displays a one-time eight-digit code after acceptance. The code is never sent as a normal wire field. | The code authorizes the intended live connection without exposing it to that untrusted connection. |
+| DD-006 | Accepted | One pairing authorizes one live session. A session can carry several sequential transfers in either direction. | Users can continue sharing without repeating the code after every transfer. |
+| DD-007 | Accepted | Only one proposal or transfer is active at a time. The initiator wins a simultaneous proposal race. | This bounds state and avoids request IDs in version 1. |
+| DD-008 | Accepted | Every transfer has a complete immutable manifest and separate recipient approval. | Pairing is not file consent. |
+| DD-009 | Accepted | Files transfer sequentially and stop on the first file failure. Completed files remain; the current partial is deleted. | This is bounded and works across common filesystems. |
+| DD-010 | Accepted | Rejection before `ready` returns to idle; failure or cancellation after `ready` closes the session. | In-flight DATA makes reuse unsafe without a transfer barrier or identifier. |
+| DD-011 | Accepted | Sessions close manually or after 600 seconds of idle time. | Temporary authorization must not remain open without a clear limit. |
+| DD-012 | Accepted | Lanweave stores no trusted devices, reusable authorization, or TLS resume state. | Every new session must repeat user authorization. |
+| DD-013 | Accepted | JSON carries control messages; binary `DATA` frames carry file bytes. | JSON is easy to inspect and binary data avoids encoding overhead. |
+| DD-014 | Accepted | Start with one Rust binary crate and internal modules. | Crate boundaries should follow proven reuse or isolation needs. |
+| DD-015 | Research Gate | Approve the exact TLS, exporter, SPAKE2 composition, and pairing dependency before a security claim. | The design is experimental and cryptographic mistakes would be critical. |
 
-## Pairing Research Gate
+## Deferred
 
-DD-010 does not reopen algorithm or profile selection. It blocks security-sensitive transfer and release until specialist review accepts the password mapping and exporter invocation and SPAKE2 AAD composition and an independently audited RFC-conformant Rust PAKE implementation and dependency tree pass exact profile vectors and adversarial interoperability tests. Vectors cover leading-zero scalar mapping, exact identities, padded `w` encoding, `TT` lengths and key splits, four-byte big-endian AAD length prefixes and field order, exact `hello` bodies without frame headers, and exporter label/output/no-context invocation; each single-component variation must reject. The exchange has exactly four `pairing` records in this order: sender A share, receiver B share, sender A confirmation, receiver B confirmation. Sender-confirmation verification moves the ceremony to sender-confirmed; mutual pairing requires the receiver confirmation to be flushed to TLS and verified by the sender.
-
-No current crate is approved. The candidate prototype surface includes `pakery-spake2` 0.2.1 plus `pakery-core` and `pakery-crypto` with its `p256` and `spake2` features. That entire dependency surface is very new and unaudited, may be used only in an interoperability prototype, and must discard `Ke`/`session_key` after confirmation. RustCrypto `spake2` is not acceptable because it targets an old draft, is unaudited, and is probably not constant-time. No custom group arithmetic or dummy PAKE path may be used to clear the gate, and coarse authentication outcomes are not a claim that protocol phases have indistinguishable timing or resource use.
-
-## Deferred Decisions
-
-Directories, resume, parallelism, compression, overwrite or rename negotiation, trusted devices, algorithm agility, QUIC, mobile support, and GUIs are deferred beyond the MVP. They must not add dormant fields or negotiation branches to version 1.
+Directories, resume, parallel files or transfers, compression, overwrite or rename, trusted devices, algorithm negotiation, QUIC, mobile support, and graphical interfaces are outside the MVP. The TUI is required and is not deferred.
