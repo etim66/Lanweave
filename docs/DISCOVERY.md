@@ -1,10 +1,20 @@
 # Discovery
 
-## Purpose And Trust
+## Purpose
 
-Lanweave uses mDNS/DNS-SD as an optional convenience for finding candidate endpoints on the local link. An advertisement answers only “where might a version 1 Lanweave listener be?” It does not prove identity, consent, pairing, availability, or safety.
+Lanweave uses mDNS/DNS-SD to show devices that are currently running the app on the local network. Discovery answers only: "Where might a Lanweave listener be?" It does not prove identity or authorize a connection.
 
-Discovery is not part of the active transfer state. Once a TCP/TLS connection is selected, an advertisement changing, expiring, or disappearing has no effect on that connection or its transfer.
+A device advertises and accepts requests only while its Lanweave process is running. There is no background daemon, offline status, trusted-device cache, or persistent advertisement. After a crash or forced exit, another device may briefly show a cached stale record until mDNS expiry; connection will fail and the record must be removed.
+
+## App Lifecycle
+
+1. Start the TCP listener.
+2. Start browsing for Lanweave services.
+3. Advertise the listener.
+4. Add, update, and remove devices in the TUI as records change or expire.
+5. Stop advertising, browsing, and listening when the app exits.
+
+Discovery may disappear while a paired session is active. This does not close or change that session.
 
 ## Service Record
 
@@ -14,33 +24,24 @@ The proposed service type is:
 _lanweave._tcp.local.
 ```
 
-SRV supplies the host and port. TXT contains at most this hint:
+SRV supplies the host and port. TXT contains only this untrusted hint:
 
 | Key | Value | Meaning |
 | --- | --- | --- |
-| `v` | `1` | Untrusted hint that the listener expects experimental protocol version `1` |
+| `v` | `1` | The listener expects experimental protocol version 1 |
 
-There are no discovery capabilities, identity fingerprints, platform values, application versions, transfer state, file metadata, display names, pairing codes, or pairing-ceremony state in TXT. Pairing codes and ceremony state MUST NOT appear in any PTR, SRV, TXT, service-instance label, host label, or other discovery field. Service-instance and host labels remain untrusted and must be safely rendered.
+Discovery records do not contain pairing codes, identity fingerprints, file metadata, transfer state, capabilities, or trusted-device data. Service and host names are untrusted text and must be safely escaped before they reach a terminal.
 
-## Behavior
+## Device List
 
-1. Start the TCP listener before advertising it.
-2. Register `_lanweave._tcp.local.` and browse while discovery is enabled.
-3. Resolve PTR, SRV, optional TXT, and A/AAAA records into bounded candidate endpoints.
-4. Preserve interface scope for link-local IPv6 addresses and retain both IPv4 and IPv6 candidates.
-5. Treat duplicates, conflicts, updates, stale records, and goodbye records as ordinary discovery events.
-6. Stop discovery independently of any active connection.
+The TUI combines records for the same service instance and shows a bounded list of current candidates. It removes stale and goodbye records. Selecting a device starts a new connection and sends a pairing request; it does not mark that device as trusted.
 
-Implementations must bound record counts, text lengths, retained candidates, resolution work, and connection attempts. Record values are hostile input. Addresses are routing information, not peer identity.
+Implementations must safely handle duplicate records, name conflicts, multiple interfaces, IPv4, scoped IPv6, changing addresses, and blocked multicast. Record counts, text lengths, retained candidates, resolution work, and connection attempts are bounded.
 
-## Direct-Address Fallback
+## Direct Address
 
-A user-supplied host or IP address and port bypasses mDNS but not provisional TLS, `hello`, pairing, or any security check. Direct-address connections MUST pair first, then send `transfer_request`, then obtain separate exact-manifest approval and prepare the destination before an accepting `transfer_response`; acceptance is followed by `ready`. They MUST NOT disclose names, sizes, or file counts before pairing. Provisional certificate acceptance still requires strict certificate structure and signature validation, including TLS 1.3 `CertificateVerify`. This fallback is required because multicast may be blocked by firewalls, guest networks, VPNs, client isolation, or platform policy.
+A user may enter a host or IP address and port when multicast discovery is unavailable. Direct addressing skips only mDNS. It still requires the same pairing request, acceptance, one-time code, authorization, and transfer approval flow.
 
-## Failure And Security
+## Security Limits
 
-Spoofed discovery can hide a peer, create noise, or direct a connection to an attacker. The fixed experimental, unaudited, release-blocked pairing profile is intended to prevent that provisional endpoint from becoming the paired peer without the receiver-generated out-of-band string; it is not yet a production assurance claim. Because pairing precedes `transfer_request`, a spoofed provisional endpoint does not receive manifest names or sizes. Discovery code must report "not found," resolution failure, connection failure, and protocol/pairing rejection as distinct outcomes without exposing cryptographic failure details. Within pairing, malformed messages or points use `invalid_message`, while an unavailable ceremony may fail before the receiver share and uses the same `authentication_failed` code as a valid correctly ordered sender-confirmation failure when a response is safe. This shared code does not guarantee equal phase or timing and does not claim to hide ceremony existence.
-
-Discovery is not private. Other LAN devices can observe service presence and advertised endpoints even when they cannot authenticate as a peer; once a connection begins they can also observe timing and traffic volume, capture or drop ciphertext, and cause denial of service.
-
-Platform prototypes must verify registration APIs, firewall behavior, multi-interface handling, scoped IPv6, conflict renaming, TTL expiry, and multicast-disabled operation. Until those tests pass, mDNS library and adapter choices remain implementation research rather than protocol commitments.
+Any LAN device can publish a false Lanweave record, copy a display name, hide a real device with noise, or direct a connection to the wrong endpoint. Pairing is what confirms the intended live connection. Other LAN devices can also observe that Lanweave is running and see connection timing and traffic volume.

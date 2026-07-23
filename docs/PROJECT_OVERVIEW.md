@@ -2,65 +2,79 @@
 
 ## Status
 
-Lanweave is currently a documentation-only project. It describes a future implementation-independent local file-transfer protocol and a Rust CLI reference implementation, but no protocol or application code exists yet.
+Lanweave is a documentation-only project. The planned application is a Rust terminal user interface for local file transfer. There is no working application yet.
 
-## MVP Release
+## Product Model
 
-The MVP transfers one immutable ordered manifest containing 1..N selected regular files between one sender and one receiver. Each entry contains only a filename and exact size; array position defines order. One successful pairing ceremony admits one connection and one transfer. The receiver reviews the exact whole manifest and prepares its destination before sending an accepting `transfer_response`; preparation failure rejects, and no file bytes are sent before acceptance and `ready`.
+Lanweave runs as a long-lived TUI. Starting `lanweave` starts the terminal interface, the local listener, and network discovery. Exiting the app stops discovery and makes the device unavailable.
 
-Files are sent sequentially. An uninterrupted file uses zero or more raw binary `DATA` frames, followed by `file_end` and at most one `file_result`; interruption may prevent a result. A file becomes part of the verified prefix only after its declared bytes and digest have been checked and its temporary file has been safely finalized.
+The product has three separate user decisions:
 
-The transfer stops on the first failure. The receiver deletes the current partial file and keeps the already verified prefix. Later files are not attempted. Whole-manifest atomicity is neither promised nor implied.
+1. **Pairing decision:** the selected device accepts or rejects a pairing request.
+2. **Code authorization:** the pairing responder shows a one-time code to the initiator, who enters it.
+3. **Transfer decision:** the recipient reviews and accepts or rejects every proposed file list.
 
-Before sending an accepting `transfer_response`, the receiver rejects:
+These decisions cannot approve one another. Accepting a pairing request does not authorize the session until the code succeeds. An authorized session does not approve any file transfer.
 
-- an empty manifest or a manifest above its fixed bounds;
-- path-like or otherwise invalid filename entries;
-- duplicate or platform-equivalent destination names;
-- names that collide with an existing destination entry; and
-- unsafe names or sizes; and
-- any destination-preparation failure after local whole-manifest approval.
+## Session Flow
 
-The manifest cannot be amended after `transfer_request`. There is no second metadata exchange, partial approval, overwrite, or rename negotiation.
+1. Both users run Lanweave.
+2. The initiator selects a visible device and sends a pairing request.
+3. The responder accepts or rejects the request.
+4. On acceptance, the responder's app creates and displays a one-time code.
+5. The initiator enters the code. The peers use it to confirm that the encrypted connection reaches the intended devices.
+6. The session becomes active. Either participant may propose a transfer.
+7. The recipient reviews file metadata and accepts or rejects the complete request.
+8. A successful transfer returns the session to idle. A failure after file data starts cleans the partial file and closes the session.
+9. More transfers may be proposed in either direction.
+10. A manual close, connection loss, app exit, or 10 minutes of session idle time ends the session.
 
-## Internal Vertical Slice
+Authorization exists only in memory for the current connection. A new session always requires a new pairing request and code. There are no trusted devices or automatic reconnects.
 
-The first implementation exercise may constrain the manifest to exactly one file. That one-file path is an internal vertical slice for proving JSON framing, raw `DATA` streaming, verification, temporary-file cleanup, and state transitions.
+## Transfer Rules
 
-It is not the MVP release. Release requires the same invariants for multiple sequential files, including a later-file failure that preserves the verified prefix and deletes only the current partial file.
+A transfer request contains an ordered list of one or more regular files. Each item contains only its filename and exact size. The recipient also sees the file count and total size calculated by the app.
 
-## Protocol Baseline
+Files are sent one at a time. Lanweave writes incoming bytes to a temporary file, checks the size and SHA-256 digest, and then safely moves the file to its final name. It never overwrites an existing file.
 
-- Exact experimental protocol version `1`; no version range or capability negotiation.
-- TLS 1.3 with a fresh ephemeral identity for each connection; no persistent device identity.
-- Receiver-initiated ceremony with a uniform CSPRNG 8-digit decimal code, including leading zeros, privately shared out of band.
-- Memory-only, one-use ceremony state with a 120-second monotonic expiry and five failed sender-confirmation verifications total across reconnects; bounded in-flight states and connection/source/CPU rate limits are separate controls.
-- Fixed RFC 9382 SPAKE2-P256-SHA256-HKDF-HMAC profile, sender A and receiver B, with no algorithm or profile negotiation. The specified SPAKE2 AAD for confirmation-key derivation contains the 32-byte exporter and exact sender and receiver `hello` JSON body bytes, excluding frame headers; these values are not inserted into RFC transcript `TT`.
-- JSON control frames and raw binary `DATA` frames.
-- Minimal vocabulary: `hello`, `pairing`, `transfer_request`, `transfer_response`, `ready`, `DATA`, `file_end`, `file_result`, `cancel`, and `error`. Exactly four role- and state-determined `pairing` records carry the two shares and two confirmations.
-- Pairing completes before `transfer_request`. The receiver then separately reviews the exact manifest, prepares its destination, and sends an accepting response only if preparation succeeds; pairing never approves unseen files.
-- TCP provides ordered reliable delivery; there are no application ACK windows.
-- No transfer-complete or close handshake; the final file's verified `file_result` is sufficient protocol completion.
-- TLS is the sole record protection. The ceremony is sender-confirmed after the receiver verifies the sender confirmation; mutual pairing additionally requires the receiver confirmation to be flushed to TLS and verified by the sender.
+The transfer stops on the first file failure. The current partial file is deleted and files already finalized remain. Rejection before `ready` keeps the paired session open. Failure after `ready` closes it because file frames may already be in flight.
 
-The algorithm and profile are selected, not open research. Release remains blocked on specialist review of the password mapping and exporter invocation and SPAKE2 AAD composition, exact certificate-verifier behavior, deterministic and adversarial vectors, and an independently audited RFC-conformant Rust PAKE implementation and dependency tree. No current crate is approved. An interoperability prototype may include `pakery-spake2` 0.2.1 plus `pakery-core` and `pakery-crypto` with its `p256` and `spake2` features, but the complete surface is very new, unaudited, and candidate-only; returned `Ke`/`session_key` material must be discarded after confirmation. RustCrypto `spake2` is unacceptable because it implements an old draft, is unaudited, and is probably not constant-time. Implementations must not write group arithmetic.
+Only one transfer request or active transfer may exist at a time. If both participants send a request at nearly the same time, the pairing initiator's request wins and the responder's request returns to its local queue. This keeps version 1 messages simple and avoids hidden concurrency.
 
-`Provisional TLS` describes only the connection before pairing. A postpairing connection is pairing-authenticated, but remains experimental and must not be treated as safe for sensitive use until the review and audit gates clear.
+## Idle Rules
+
+The session idle timer starts when pairing completes and restarts whenever a transfer finishes or is rejected. It expires after 600 consecutive seconds without a new transfer request. An active transfer uses separate progress timeouts and does not count as idle.
+
+Pairing prompts and transfer approval prompts also have shorter local deadlines so an unattended prompt cannot hold resources forever. The exact prompt deadlines are implementation policy; the session idle maximum is fixed at 10 minutes.
 
 ## Goals
 
-- Direct local transfer without a mandatory service or account.
-- Pairing before manifest disclosure, followed by separate exact receiver consent.
-- Exact receiver consent for the full manifest.
-- Bounded parsing, buffering, file I/O, and queueing.
-- Deterministic fail-fast behavior and safe destination handling.
-- A small wire format that independent implementations can test.
-- mDNS convenience with direct-address fallback.
+- Make local file transfer easy from a terminal.
+- Show only devices that are currently running Lanweave.
+- Require clear approval for pairing and for each transfer.
+- Keep all session authorization temporary.
+- Allow either participant to send files during an active session.
+- Use bounded memory, queues, parsing, and disk operations.
+- Avoid a required account, cloud service, or internet connection.
+- Keep the wire protocol small enough to test thoroughly.
 
 ## Non-Goals
 
-The MVP excludes directories, resume, parallel files or chunks, compression, overwrite or rename negotiation, trusted-device shortcuts, algorithm agility, QUIC, mobile clients, and GUIs. It also does not provide anonymity, protect a compromised endpoint, cross a network that blocks peer connectivity, or make discovery records trustworthy.
+The MVP excludes directories, resume, parallel files, compression, overwrite or rename negotiation, trusted devices, automatic acceptance, QUIC, mobile clients, and graphical interfaces. A TUI is required and is not considered a graphical interface.
+
+Lanweave does not provide anonymity, protect a compromised computer, make received content safe to open, or guarantee connectivity on networks that block peer traffic.
 
 ## Success Criteria
 
-An MVP candidate must transfer multiple files in manifest order over one pairing-authenticated connection, verify and finalize every successful file, report each result, and satisfy the defined preparation, rejection, failure, and collision behavior on supported platforms. Specialist composition review, an independently audited RFC-conformant PAKE implementation and dependencies, exact profile/interoperability vectors, adversarial tests, fuzzing, and cross-platform filesystem tests are release gates. No sensitive release is permitted before the security gate clears.
+An MVP candidate must:
+
+- open a usable TUI on supported desktop terminals;
+- list commands when the user enters `/`;
+- start and stop discovery with the app;
+- complete pairing request, accept/reject, code, and authorization flows;
+- send multiple files safely after separate recipient approval;
+- support later transfers in either direction in one session;
+- close manually and after at most 10 idle minutes;
+- require fresh authorization for every new session;
+- pass cross-platform filesystem, protocol, fault, and security-profile tests; and
+- complete the cryptographic review and dependency audit before claiming security.
