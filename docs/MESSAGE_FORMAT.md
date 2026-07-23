@@ -1,441 +1,183 @@
 # Message Format
 
-## Status and design goals
+This document is normative for experimental protocol version 1. The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe interoperability requirements. The selected pairing schema is experimental; implementation and cryptographic review remain release-blocking.
 
-This is a language-neutral, strongly typed logical schema for proposed protocol 1.0. Rust structs/enums may represent it later, but Rust/Serde behavior is not the wire specification. Exact numeric registry values and the cryptographic handshake payload remain draft.
+## JSON profile
 
-## Serialization evaluation
+Control frames contain JSON with this fixed profile:
 
-| Format | Strengths | Trade-offs for Lanweave |
-| --- | --- | --- |
-| CBOR | Compact binary, standardized data model, deterministic encoding rules, flexible schema | Must restrict duplicate keys, nesting, indefinite lengths, numeric keys, and canonical form; library behavior must be verified |
-| MessagePack | Compact, broad implementations, simple model | No single equally strong canonical profile; extension/schema conventions must be designed |
-| Protocol Buffers | Mature IDL, efficient generated types, good field evolution | Tooling/generated code; signatures/transcripts and unknown-field preservation require care; less inspectable without schema |
-| postcard | Very compact Serde-oriented format, attractive in Rust | Rust-centric ecosystem, schema evolution/cross-language interoperability less established for this goal |
-| JSON | Human-readable and ubiquitous | Larger; number/string ambiguity, duplicate keys, canonical signing, binary chunks, and parser abuse require extra rules |
+- The body MUST be UTF-8 without a BOM and contain exactly one top-level object. Trailing non-whitespace data is invalid.
+- Every object MUST reject duplicate fields and fields not defined for that message. Fields are at the top level; there is no `payload` envelope.
+- Object field order and insignificant whitespace have no semantic meaning, except the exact two `hello` body byte strings are retained without reserialization for the cryptographic pairing binding.
+- Numbers MUST be integers from `0` through `9007199254740991` (`2^53-1`). Negative numbers, floats, exponent notation, `NaN`, and infinities are invalid.
+- `null` is not used. A field is either required or omitted.
+- Strings MUST decode to valid Unicode scalar values. A filename is additionally limited to 255 UTF-8 bytes. `display_name` is limited to 128 UTF-8 bytes. A `reason` or `code` is limited to 64 ASCII bytes.
+- A field name is limited to 32 ASCII bytes, an object to 32 fields, an array to 1,024 elements, and nesting to 8 levels.
+- A JSON frame body has a generic hard allocation limit of 1 MiB (1,048,576 bytes). Each exact `hello` body MUST NOT exceed 4,000 bytes, a `pairing` body MUST NOT exceed 4,096 bytes, and a `transfer_request` body MUST NOT exceed 256 KiB (262,144 bytes). Each limit includes JSON syntax and whitespace.
+- Pairing binary values use canonical RFC 4648 URL-safe base64 without `=` padding. Decoders MUST reject padding, non-URL-safe alphabets, whitespace, non-canonical encodings, and the wrong encoded or decoded length.
+- A SHA-256 value MUST be exactly 64 lowercase hexadecimal characters.
 
-My current choice for the first implementation is CBOR with deterministic encoding based on RFC 8949. The Lanweave profile will use fixed numeric field keys and definite lengths, reject duplicate keys, bound nesting and collection sizes, and avoid floating-point values in protocol-critical fields. The examples remain JSON-like because they are easier to read.
+Implementations MUST apply these rules independently of their JSON library's defaults and MUST use checked arithmetic when summing sizes. The generic 1 MiB bound is enforced from the frame header before body allocation. A message-specific limit applies only after bounded parsing identifies `type`; state alone does not identify an unparsed JSON body because terminal controls may be valid in that state. An oversized `hello` or `pairing` is `invalid_message`; a structurally valid oversized `transfer_request` receives a rejecting `transfer_response` with reason `invalid_manifest`.
 
-This is still a proposed choice. I want cross-language interoperability tests before freezing it.
+## Messages
 
-## Types and conventions
+The `type` field is required and has one of the exact lowercase values below. Unless stated otherwise, every listed field is required.
 
-- `ID` is a 16-byte UUIDv4 on wire; text examples use canonical UUID syntax.
-- `u16/u32/u64` are non-negative fixed semantic ranges regardless of codec representation; overflow rejects.
-- `bytes<N>` is an exact-length byte string; `bytes<=N` is bounded.
-- `text<=N` is valid UTF-8 bounded in encoded bytes; controls may be further forbidden.
-- `duration_ms` is a relative duration, not a trusted remote deadline.
-- Arrays have explicit maxima. Maps reject duplicate keys.
-- Hashes and keys are binary on wire; examples abbreviate them.
-
-UUIDv4 is recommended because it is random, clock-independent, and does not disclose creation time. UUIDv7 sorts well but embeds time and relies on clock behavior; reserve it for privacy-reviewed local databases. IDs provide correlation/collision resistance, not authentication or secrecy.
-
-## Common envelope
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `protocol_version` | `{major:u16, minor:u16}` | Yes | Negotiated wire version; negotiation messages carry proposed context | Must match current negotiated version after negotiation |
-| `message_type` | closed/registry enum | Yes | Payload discriminator | Known and enabled in state/capability; unknown critical type rejects |
-| `message_id` | ID | Yes | Unique logical message ID | Non-nil; not previously accepted in session/replay window |
-| `correlation_id` | ID | No | Message/request being answered | Required by response definition; must identify expected object |
-| `sequence` | u64 | Conditional | Per-direction secure-session record sequence | Required after key establishment; exact expected value; no reuse/wrap |
-| `secure_session_id` | ID | Conditional | Active secure session | Required for secure messages and must match state |
-| `sent_at_ms` | signed/unsigned integer | No | Sender wall-clock diagnostic only | Bounded representation; never sole expiry/replay evidence |
-| `payload_length` | u32 | Yes | Serialized payload bytes inside envelope | Must equal decoded payload span and type limit; frame remains authoritative boundary |
-| `flags` | bit set | No | Critical/response/final/protection hints | Reserved bits zero; flags cannot weaken message's required protection |
-| `payload` | typed map | Yes | Message-specific fields | Strict type/schema/state validation |
-
-Timestamps are untrusted: peers may have wrong or malicious clocks. Local receipt time plus monotonic timers enforce expiry. Replay prevention uses fresh challenges/session keys, transcript binding, sequence windows, consumed-token state, and limited replay caches—not timestamps or UUIDs alone.
-
-## Identifier lifecycle
-
-| Identifier | Created by | Lifetime and purpose |
-| --- | --- | --- |
-| Device ID | Installation | Persistent public identity handle, associated with device public key; not authorization |
-| Instance ID | Each process | Process lifetime; distinguishes restart/concurrent instance |
-| Message ID | Message sender | One logical message; responses correlate to it; retransmission policy must not create a new semantic action accidentally |
-| Request ID | Sender | Proposal through reject/expiry or accepted transfer association |
-| Token ID | Receiver | One challenge; public identifier consumed with token |
-| Pairing-session ID | Receiver | Acceptance/token/key-establishment context through failure or secure confirmation |
-| Secure-session ID | Handshake result/assigned and confirmed by both | One established key/transcript context; never reused after reconnect |
-| Transfer ID | Receiver on acceptance | Approved manifest/data/completion context |
-| File ID | Sender | Unique within transfer (SHOULD be globally random); one metadata/data/hash stream |
-
-Every namespace uses a distinct typed wrapper even though binary representation is the same. Implementations MUST NOT compare a file ID as a transfer ID accidentally.
-
-## Protection classes
-
-- **P0 Unauthenticated:** mDNS and the minimal connection preface. No secrets or side effects.
-- **P1 Provisional channel:** preferably TLS-encrypted, but pairing identity not yet authenticated. Input remains hostile.
-- **P2 Secure session:** encrypted/authenticated and sequenced under the pairing-bound session.
-
-P1 does not satisfy requirements that say “secure session.” If a transport profile cannot provide P1 confidentiality, direct token submission is forbidden unless a reviewed proof replaces it.
-
-## Message behavior matrix
-
-This table defines purpose, direction, valid state, expected response/timeout, and security for every message. Field validation follows in the next section.
-
-| Message | Purpose; sender → receiver | Valid state | Expected response / timeout behavior | Security considerations |
-| --- | --- | --- | --- | --- |
-| `DeviceHello` | Identify instance and advertised identity/capabilities; either → peer | Connected, before negotiation | Peer `DeviceHello` then negotiation; connection deadline | P1 preferred; claims untrusted until pairing; no private data |
-| `DeviceGoodbye` | Advisory planned departure; either → peer | Any connected non-terminal state | `SessionClosed` if secure, otherwise close; no wait required | P1/P2 matching state; never treat as proof of peer disappearance |
-| `ProtocolNegotiation` | Offer version/frame/capability/crypto profiles; initiator → responder (or symmetric profile) | Negotiating | Accepted/rejected within 10 s | P1; all offers transcript-bound; no downgrade fallback outside offer |
-| `ProtocolNegotiationAccepted` | Select common parameters; responder → initiator and confirmation if defined | Negotiating | Peer validation/confirmation; 10 s | Selection subset of offers; bind exact canonical bytes |
-| `ProtocolNegotiationRejected` | Report incompatibility; responder → initiator | Negotiating | Graceful close within 5 s | Coarse ranges safe; no transfer handling |
-| `TransferRequest` | Propose bounded metadata-only transfer; sender → receiver | Negotiated/Idle | Accepted/rejected before 120 s | P1; rate-limit; no content/local paths |
-| `TransferAccepted` | Record explicit approval and assign transfer/pairing IDs; receiver → sender | Waiting decision | Challenge follows promptly; request timer stops | P1; must reflect local user action, exact request |
-| `TransferRejected` | Decline request; receiver → sender | Waiting decision | Request terminal; connection may remain | P1; coarse reason avoids policy leak |
-| `PairingTokenChallenge` | Announce token ID/expiry/attempts/proof parameters; receiver → sender | Accepted/token generated | Submission before 60 s | P1; MUST NOT contain token or offline-verifiable low-entropy material |
-| `PairingTokenSubmission` | Submit token or negotiated proof; sender → receiver | Waiting token submission | Accepted/rejected before remaining deadline | P1 confidentiality required for direct token; attempts counted before expensive work |
-| `PairingTokenAccepted` | Confirm authorization step; receiver → sender | Verifying token | Begin key establishment immediately | P1; does not itself establish identity/session; bind result to transcript |
-| `PairingTokenRejected` | Generic bad/expired/exhausted result; receiver → sender | Verifying token | Retry only if attempts/deadline remain; otherwise fail/close | P1; avoid oracle/detail/timing leakage |
-| `KeyExchangeInit` | Start selected reviewed AKE profile; initiator → responder | Token accepted/establishing | Response within 10 s | P1/handshake protection; opaque profile data, transcript/identities bound |
-| `KeyExchangeResponse` | Continue/complete reviewed AKE; responder → initiator | Establishing | Session confirmation within 10 s | Same; validation failure erases secrets/closes |
-| `SessionEstablished` | Explicit key/transcript confirmation; each → peer | Key material ready | Both confirmations required before metadata; 10 s | P2 handshake keys; secure session/role/transcript exact match |
-| `FileMetadata` | Declare exact file manifest entry; sender → receiver | Secure, receiving metadata | All entries then `TransferReady`; session idle timeout | P2; names/sizes/hash hostile and bounded |
-| `TransferReady` | Confirm manifest/destination/resources/window; receiver → sender | Metadata validated | First chunk/file completion; 30 s inactivity | P2; no local paths; commits receive policy only for this manifest |
-| `FileChunk` | Carry contiguous file bytes; sender → receiver | Transferring current file | Checkpoint ACK; inactivity/window timers | P2; length/offset/window checked before write |
-| `ChunkAcknowledgement` | Report highest contiguous accepted offset/window; receiver → sender | Transferring | Sender advances window; no direct response | P2; never trust beyond bytes sent/file size; not completion |
-| `FileComplete` | Declare sender end length/hash; sender → receiver | All bytes sent for file | Verification; next metadata/file or transfer completion | P2; receiver independently compares; mismatch fails |
-| `TransferComplete` | Report/confirm all files verified; receiver then sender confirmation | Verifying/all finalized | Correlated confirmation then close | P2; cannot be inferred from EOF/ACK; contains results not paths |
-| `TransferCancelled` | Cancel active request/pairing/transfer; either → peer | Any non-terminal relevant state | Stop work, cleanup, optional close | P1 before session/P2 after; idempotent; race has deterministic precedence |
-| `SessionClosed` | Request/ack graceful secure close; either → peer | Secure non-terminal or completing | Correlated ACK; transport closes within 5 s | P2; erase keys after send/ack/deadline; no reuse |
-| `Ping` | Liveness probe; either → peer | Negotiated idle or secure active | `Pong` within 10 s | Same protection as state; rate-limit, no timer amplification |
-| `Pong` | Correlated liveness reply; peer → pinger | Awaiting pong | Clear probe timer | Same protection; echo only nonce, not arbitrary payload |
-| `Error` | Coarse structured failure; either → peer | State where offending context is parseable | State-specific; fatal closes | Same protection as context; never expose secrets/internal details; no error loops |
-
-## Payload field tables
-
-Envelope fields above apply to every message and are not repeated.
-
-### `DeviceHello`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `device_id` | ID | Yes | Claimed persistent device handle | Non-nil; later must match authenticated key association |
-| `instance_id` | ID | Yes | Current process instance | Non-nil; not local instance |
-| `device_public_key` | bytes<=64 | Yes | Encoded identity public key/profile | Valid negotiated encoding; fingerprint/ID consistency checked later |
-| `display_name` | text<=128 | No | Untrusted UI label | Escape controls/bidi policy; never identity |
-| `application_version` | text<=64 | No | Diagnostic build version | Untrusted; safe characters preferred |
-
-### `DeviceGoodbye`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `instance_id` | ID | Yes | Departing process | Must match connected peer |
-| `reason` | enum | No | `Shutdown`, `Restart`, `Unavailable` | Known non-critical value or ignore |
-
-### `ProtocolNegotiation`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `version_ranges` | array<=8 of ranges | Yes | Supported major/minor intervals | Sorted, non-overlapping, sane u16 endpoints |
-| `frame_versions` | array<=8 u8 | Yes | Supported frame formats | Unique; includes header version used for negotiation profile |
-| `capabilities` | array<=128 capability | Yes | Optional and required features/parameters | Unique IDs; parameter bytes<=4096 total |
-| `handshake_profiles` | array<=16 enum | Yes | Reviewed channel/AKE profiles supported | Unique; experimental disabled by default |
-| `algorithm_suites` | array<=16 enum | Yes | Permitted identity/KEX/KDF/AEAD/hash suites | Unique, locally allowed |
-| `max_control_frame` | u32 | Yes | Offered receive maximum | 4 KiB–1 MiB |
-| `max_data_payload` | u32 | Yes | Offered chunk maximum | 64 KiB–1 MiB |
-
-### `ProtocolNegotiationAccepted`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `selected_version` | version | Yes | Common protocol version | In both offered ranges and local policy |
-| `frame_version` | u8 | Yes | Selected framing | In both offers |
-| `capabilities` | array<=128 capability | Yes | Selected optional/required set | Subset satisfying all required capabilities |
-| `handshake_profile` | enum | Yes | Selected reviewed profile | Offered and enabled |
-| `algorithm_suite` | enum | Yes | Selected algorithms | Offered, profile-compatible, non-deprecated |
-| `control_frame_limit` | u32 | Yes | Effective minimum limit | ≤ both maxima and protocol max |
-| `data_payload_limit` | u32 | Yes | Effective minimum chunk limit | Within legal range and both offers |
-| `offer_hash` | bytes<32> | Yes | Hash of canonical offers/order/roles | Exact locally computed value |
-
-### `ProtocolNegotiationRejected`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `reason` | enum | Yes | Version/capability/profile incompatibility | Coarse known value |
-| `supported_versions` | array<=8 ranges | Yes | Responder range for diagnostics | Same validation as offer |
-| `missing_capabilities` | array<=32 IDs | No | Unmet critical capabilities | Bounded; no implementation details |
-
-### `TransferRequest`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `request_id` | ID | Yes | Proposal identity | Fresh/non-nil |
-| `file_count` | u32 | Yes | Number of proposed files | 1–1024 and equals summaries length |
-| `total_size` | u64 | Yes | Sum of exact proposed lengths | Checked sum of summaries; local policy |
-| `summaries` | array<=1024 summary | Yes | `{file_id, display_name, size}` only | Unique file IDs; names<=255; checked sum; total metadata<=256 KiB |
-| `note` | text<=512 | No | Sender note | Escape controls; not authorization |
-
-### `TransferAccepted`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `request_id` | ID | Yes | Approved request | Matches pending request/correlation |
-| `transfer_id` | ID | Yes | Assigned transfer | Fresh/non-nil |
-| `pairing_session_id` | ID | Yes | Assigned pairing context | Fresh/non-nil |
-| `accepted_file_ids` | array<=1024 ID | Yes | Approved set | Initially exactly request set/order; unique |
-| `request_expires_in_ms` | u32 | No | Remaining advisory duration | ≤ local pending deadline; local timer authoritative |
-
-### `TransferRejected`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `request_id` | ID | Yes | Rejected request | Matches pending request |
-| `reason` | enum | Yes | `UserRejected`, `Policy`, `Busy`, `Invalid`, `Expired` | Known/coarse |
-| `retry_after_ms` | u32 | No | Advisory cooldown | Bounded ≤24 h; not promise |
-
-### `PairingTokenChallenge`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `token_id` | ID | Yes | Public challenge handle | Fresh/non-nil |
-| `pairing_session_id` | ID | Yes | Binding context | Matches accepted pairing |
-| `expires_in_ms` | u32 | Yes | Relative token lifetime | 1,000–60,000 recommended/max profile |
-| `attempts_allowed` | u8 | Yes | Total submission budget | 1–5 |
-| `verification_method` | enum | Yes | `DirectSubmission` or reviewed proof profile | Negotiated and allowed; direct requires P1 confidentiality |
-| `challenge_data` | bytes<=4096 | Conditional | Public PAKE/proof parameters | Profile-valid; MUST NOT contain token or enable avoidable offline guessing |
-| `token_format_hint` | enum | No | Human input alphabet/length hint | From negotiated safe registry; does not reveal value |
-
-### `PairingTokenSubmission`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `token_id` | ID | Yes | Target challenge | Active, unconsumed, unexpired |
-| `pairing_session_id` | ID | Yes | Pairing context | Exact match |
-| `method` | enum | Yes | Negotiated verification method | Exact challenge method |
-| `token` | secret text<=64 | Conditional | Manually entered token for direct method | Alphabet/length; never log; P1 confidential channel required |
-| `proof` | bytes<=4096 | Conditional | Reviewed method's next proof/message | Profile-valid; exactly one of token/proof as method requires |
-| `attempt_number` | u8 | Yes | Sender view of attempt | Must equal expected next attempt; receiver budget authoritative |
-
-### `PairingTokenAccepted`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `token_id` | ID | Yes | Consumed successful challenge | Matches active token |
-| `pairing_session_id` | ID | Yes | Pairing context | Exact match |
-| `verification_binding` | bytes<32> | Yes | Domain-separated hash/PAKE binding for transcript | Locally recomputed under selected reviewed profile; never token hash alone |
-
-### `PairingTokenRejected`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `token_id` | ID | Yes | Challenge attempted | Matches or generic handling without oracle |
-| `pairing_session_id` | ID | Yes | Pairing context | Exact match |
-| `reason` | enum | Yes | `Invalid`, `Expired`, `AttemptsExhausted` | Coarse; do not reveal proof detail |
-| `attempts_remaining` | u8 | No | Remaining online attempts | 0–4; omit if method analysis recommends less leakage |
-
-### `KeyExchangeInit`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `pairing_session_id` | ID | Yes | Approved pairing being upgraded | Exact active pairing |
-| `handshake_profile` | enum | Yes | Selected reviewed construction | Equals negotiated profile |
-| `handshake_step` | u8 | Yes | Profile step number | Exactly expected |
-| `handshake_data` | bytes<=16KiB | Yes | Opaque standard-protocol message/contribution | Parsed only by selected reviewed library/profile; bounded |
-| `transcript_hash` | bytes<32> | Yes | Lanweave pre-handshake transcript checkpoint | Exact canonical local value |
-
-### `KeyExchangeResponse`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `pairing_session_id` | ID | Yes | Pairing context | Exact match |
-| `handshake_profile` | enum | Yes | Selected construction | Exact match |
-| `handshake_step` | u8 | Yes | Response step | Exactly expected |
-| `handshake_data` | bytes<=16KiB | Yes | Opaque reviewed-profile response | Library/profile validation; bounded |
-| `transcript_hash` | bytes<32> | Yes | Transcript including init | Exact local value |
-
-These two messages intentionally do not standardize raw signature/ephemeral fields until DD-005/DD-010 selects a reviewed profile. A profile may require additional round trips; if so, protocol 1.0 schema/state must be revised rather than overloading fields ambiguously.
-
-### `SessionEstablished`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `secure_session_id` | ID | Yes | New secure context | Fresh; both peers derive/agree same value |
-| `pairing_session_id` | ID | Yes | Source pairing | Exact active pairing |
-| `transcript_hash` | bytes<32> | Yes | Final authenticated transcript | Exact locally computed value |
-| `peer_role` | enum | Yes | Sender/receiver confirmation direction | Expected opposite role |
-| `key_confirmation` | bytes<=64 | Yes | Profile-specific confirmation authenticator | Constant-time/profile verify; direction-separated |
-
-### `FileMetadata`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `transfer_id` | ID | Yes | Approved transfer | Active transfer |
-| `file_id` | ID | Yes | File identity | In accepted summaries; unique/not already declared |
-| `ordinal` | u32 | Yes | Sequential order | 0..file_count-1, no duplicates |
-| `display_name` | text<=255 | Yes | Untrusted component suggestion | Matches approved summary or permitted canonical update; safe mapping |
-| `size` | u64 | Yes | Exact byte length | Matches request summary; policy/storage/check arithmetic |
-| `sha256` | bytes<32> | No | Precomputed exact-byte digest | If present must match `FileComplete` |
-| `name_was_lossy` | bool | No | Source name replacement indicator | Default false |
-| `media_type` | text<=127 | No | Informational MIME-style hint | Syntax/bounds; never auto-execute |
-
-### `TransferReady`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `transfer_id` | ID | Yes | Manifest accepted | Active transfer/all metadata validated |
-| `manifest_hash` | bytes<32> | Yes | Canonical metadata set hash | Exact local value |
-| `chunk_size` | u32 | Yes | Effective maximum payload | Negotiated 64 KiB–1 MiB |
-| `receive_window_bytes` | u32 | Yes | Maximum unacknowledged payload | ≥chunk size; bounded local policy |
-| `ack_checkpoint_bytes` | u32 | Yes | Cumulative ACK threshold | ≤window; proposed 4 MiB |
-| `overwrite_policy` | enum | No | Coarse `Reject`/`Renamed`/`ApprovedReplace` | No destination/path disclosure |
-
-### `FileChunk`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `transfer_id` | ID | Yes | Active transfer | Exact match |
-| `file_id` | ID | Yes | Current file | Exact expected ordinal/file |
-| `offset` | u64 | Yes | First byte position | Equals next expected contiguous offset |
-| `data` | bytes<=1MiB | Yes | File bytes | Non-empty except no chunk for zero file; ≤negotiated size/window/remaining |
-| `end_hint` | bool | No | Sender expects final chunk | Must imply offset+length=size; not completion proof |
-
-### `ChunkAcknowledgement`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `transfer_id` | ID | Yes | Transfer | Active match |
-| `file_id` | ID | Yes | File | Current/recent file allowed by state |
-| `next_offset` | u64 | Yes | Highest contiguous accepted byte end | Monotonic, ≤sent and declared size |
-| `receive_window_bytes` | u32 | Yes | Updated application window | Bounded; zero only temporarily |
-| `durable` | bool | Yes | Whether bytes are durably flushed | Must be false in initial profile unless capability negotiated |
-
-### `FileComplete`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `transfer_id` | ID | Yes | Transfer | Active match |
-| `file_id` | ID | Yes | Completed file | Current file; all bytes sent/received before receiver accepts |
-| `final_size` | u64 | Yes | Sender observed stream length | Equals metadata/request and final offset |
-| `sha256` | bytes<32> | Yes | Sender hash of transmitted bytes | Equals metadata hash if present; receiver independently compares |
-
-### `TransferComplete`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `transfer_id` | ID | Yes | Completed transfer | All accepted files verified/finalized |
-| `manifest_hash` | bytes<32> | Yes | Completed manifest identity | Matches `TransferReady` context |
-| `files_completed` | u32 | Yes | Count verified/finalized | Equals approved count |
-| `total_bytes` | u64 | Yes | Total verified bytes | Equals checked manifest total |
-| `confirmation` | bool | Yes | `false` receiver report; `true` sender acknowledgement | Direction/state exact; correlate acknowledgement |
-
-### `TransferCancelled`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `scope` | enum | Yes | `Request`, `Pairing`, `Transfer` | Must match supplied ID/current state |
-| `scope_id` | ID | Yes | ID being cancelled | Active and owned by context |
-| `reason` | enum | Yes | `User`, `Timeout`, `Policy`, `Shutdown`, `PeerRequest` | Coarse known value |
-| `last_file_id` | ID | No | Diagnostic current file | Must belong to transfer; no path |
-| `last_offset` | u64 | No | Diagnostic contiguous progress | ≤declared size; not resume authorization |
-
-### `SessionClosed`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `secure_session_id` | ID | Yes | Session closing | Active match |
-| `reason` | enum | Yes | `Complete`, `Cancelled`, `Timeout`, `Shutdown`, `Error` | Coarse known value |
-| `acknowledgement` | bool | Yes | False request / true response | Response correlates to close request; one round trip max |
-
-### `Ping`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `probe_id` | ID | Yes | Liveness probe | Fresh; one bounded outstanding probe |
-| `nonce` | bytes<16> | Yes | Random echo value | CSPRNG; not AEAD nonce/key material |
-
-### `Pong`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `probe_id` | ID | Yes | Probe answered | Matches outstanding `Ping` and correlation |
-| `nonce` | bytes<16> | Yes | Exact echoed probe bytes | Constant/exact comparison; no additional payload |
-
-### `Error`
-
-| Field | Type | Required | Description | Validation |
-| ----- | ---- | -------: | ----------- | ---------- |
-| `code` | error registry enum | Yes | Stable coarse code | Known; unknown handled as generic fatal semantics |
-| `fatal` | bool | Yes | Sender will terminate affected scope | Receiver still applies local state rules |
-| `scope` | enum | No | Connection/request/pairing/session/transfer/file | Consistent with scope ID/state |
-| `scope_id` | ID | No | Affected object | Required when scope has ID and known |
-| `retry_after_ms` | u32 | No | Advisory rate-limit delay | ≤24 h; local policy authoritative |
-| `message` | text<=512 | No | Safe generic human hint | No secrets, paths, parser internals, or unescaped remote reflection |
-
-## Logical examples
-
-Examples omit the binary frame and abbreviate hashes. They are not JSON wire encodings.
+### `hello`
 
 ```json
-{
-  "protocol_version": {"major": 1, "minor": 0},
-  "message_type": "TransferRequest",
-  "message_id": "7e36665e-4f70-4a93-8d7f-8f35fb21b561",
-  "payload": {
-    "request_id": "97836efe-7af8-41d6-9464-9b2cc7c18436",
-    "file_count": 1,
-    "total_size": 1048576,
-    "summaries": [{"file_id": "abb8...", "display_name": "report.pdf", "size": 1048576}]
-  }
-}
+{"type":"hello","version":1,"display_name":"Workstation"}
 ```
+
+- `version` MUST be the integer `1`. An otherwise valid `hello` with another non-negative integer version receives `unsupported_version`; a missing or wrongly typed version is `invalid_message`.
+- `display_name` is optional, untrusted text for display only.
+
+The sender sends the first `hello`; the receiver sends the second. No capabilities, framing versions, limits, certificates, pairing codes, or algorithms are offered or selected. Each exact body is at most 4,000 bytes. Each peer MUST retain both exact JSON frame body byte strings through pairing. Pairing uses those original bytes, not a normalized or reserialized representation. With the AAD's fixed 67-byte overhead, the two bodies produce at most 8,067 bytes, below the RFC 9382 AAD limit of 8,176 bytes.
+
+### `pairing`
+
+Share:
 
 ```json
-{
-  "message_type": "PairingTokenChallenge",
-  "correlation_id": "<TransferAccepted message ID>",
-  "payload": {
-    "token_id": "6fb0...",
-    "pairing_session_id": "d32d...",
-    "expires_in_ms": 60000,
-    "attempts_allowed": 5,
-    "verification_method": "DirectSubmission",
-    "token_format_hint": "EightBase32Characters"
-  }
-}
+{"type":"pairing","step":"share","data":"BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU"}
 ```
 
-Notice that the challenge has no token. Direct submission, if experimentally enabled, carries it only in the secret `token` field over a confidential provisional channel.
+Confirmation:
 
 ```json
-{
-  "message_type": "FileChunk",
-  "secure_session_id": "31aa...",
-  "sequence": 42,
-  "payload": {"transfer_id": "b28f...", "file_id": "abb8...", "offset": 262144, "data": "<262144 bytes>"}
-}
+{"type":"pairing","step":"confirm","data":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
 ```
+
+These values illustrate canonical encoding and exact length only; they are not one valid exchange transcript.
+
+Each `pairing` object contains exactly `type`, `step`, and `data`:
+
+- `step` MUST be exactly `share` or `confirm`.
+- A `share` decodes to exactly 65 bytes and its unpadded base64url text is exactly 87 ASCII characters. The decoded value MUST be a valid SEC1 uncompressed P-256 point with the `0x04` prefix and pass the RFC 9382 validation required for the expected peer role.
+- A `confirm` decodes to exactly 32 bytes and its unpadded base64url text is exactly 43 ASCII characters. It is the expected RFC 9382 HMAC-SHA256 key-confirmation tag.
+
+Exactly four pairing records occur after both `hello` messages and before `transfer_request`:
+
+1. sender Party A `share`;
+2. receiver Party B `share`;
+3. sender Party A `confirm`;
+4. receiver Party B `confirm`.
+
+Strict connection state and message direction determine the role. There is no role, code, attempt number, remaining-attempt count, algorithm, identity, certificate, exporter, or profile field. The pairing code never appears on the wire. An extra, duplicate, reversed, or wrong-state record is invalid and terminal.
+
+The receiver sends its confirmation only after the sender confirmation validates and the code is atomically consumed. The sender MUST verify the receiver confirmation. Pairing is successful for a peer only when its entire outgoing framed confirmation has been accepted by the TLS writer and successfully flushed, and the peer confirmation required by its role has verified. Commitment does not prove peer delivery. A correctly encoded and ordered sender or receiver confirmation that fails cryptographic verification uses only `authentication_failed` when safe, or a silent close. Only a failed sender-confirmation verification admitted against an active ceremony affects the receiver's failed-confirmation counter. Ceremony unavailability, expiry, exhaustion, consumption, or nonexistence may produce that result or a silent close earlier in pairing; phase, timing, and availability are not hidden, and no dummy PAKE is performed merely to hide them.
+
+### `transfer_request`
+
+```json
+{"type":"transfer_request","files":[{"name":"report.pdf","size":1048576},{"name":"empty.txt","size":0}]}
+```
+
+- `files` MUST contain 1 through 1,024 entries.
+- Each entry MUST contain exactly `name` and `size`.
+- `name` MUST be a non-empty filename component, not a path. It MUST NOT be `.`, `..`, contain `/`, `\`, NUL, or a control character, or exceed 255 UTF-8 bytes. The receiver also applies destination-platform filename rules.
+- `size` is the exact byte count and MUST be at most `2^53-1`. Zero is valid.
+
+Array order is file order. The file count and total byte count are derived from `files`; they are not transmitted. The checked total MUST also be at most `2^53-1`. The manifest is immutable after this message.
+
+The sender sends `transfer_request` only after mutual pairing succeeds. The PAKE does not bind these previously unseen bytes; the now-authenticated TLS connection protects them.
+
+### `transfer_response`
+
+Accepted:
+
+```json
+{"type":"transfer_response","accepted":true}
+```
+
+Rejected:
+
+```json
+{"type":"transfer_response","accepted":false,"reason":"destination_exists"}
+```
+
+- `accepted` MUST be a boolean.
+- `reason` MUST be present only when `accepted` is `false`.
+- The version-1 rejection reasons are `user_rejected`, `invalid_manifest`, `invalid_filename`, `name_conflict`, `destination_exists`, `insufficient_storage`, `resource_limit`, and `unavailable`.
+
+The receiver sends this message only after separately validating and presenting the complete post-pairing manifest for approval. Before sending `accepted: true`, it MUST also prepare the destination and required resources. A preparation failure sends `accepted: false` with the applicable existing reason. Acceptance applies to the whole ordered manifest. Version 1 has no subset response and no accepted-but-not-ready application failure state.
+
+### `ready`
+
+```json
+{"type":"ready"}
+```
+
+After successful destination and resource preparation, the receiver sends the accepting `transfer_response` followed immediately by `ready`. It means the receiver is ready for DATA for manifest index 0. It does not confirm pairing, modify the manifest, or authorize DATA for any other state. The sender MUST wait for `ready` before sending DATA. Failure to write either message is a transport failure, not an application state in which an accepted request awaits later preparation.
+
+### `file_end`
+
+```json
+{"type":"file_end","index":1,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+```
+
+- `index` is the zero-based manifest index and MUST be the current file.
+- `sha256` is the sender's digest of exactly the bytes sent for that file.
+
+### `file_result`
+
+Verified:
+
+```json
+{"type":"file_result","index":1,"status":"verified"}
+```
+
+Failed:
+
+```json
+{"type":"file_result","index":1,"status":"failed","code":"hash_mismatch"}
+```
+
+- `index` MUST identify the current file.
+- `status` MUST be `verified` or `failed`.
+- `code` MUST be absent for `verified` and present for `failed`.
+- The version-1 failure codes are `size_mismatch`, `hash_mismatch`, `write_failed`, `destination_exists`, and `insufficient_storage`.
+
+A receiver MAY send a failed result as soon as the current file fails, including while the sender is still sending DATA. It MUST delete the current temporary file before committing that result.
+
+### `cancel`
+
+```json
+{"type":"cancel","code":"user_cancelled"}
+```
+
+The version-1 cancellation codes are `user_cancelled`, `source_unavailable`, and `shutdown`. Sending or receiving `cancel` is terminal for the connection.
+
+### `error`
+
+```json
+{"type":"error","code":"unsupported_version"}
+```
+
+The version-1 error codes are `unsupported_version`, `invalid_message`, `authentication_failed`, `timeout`, `resource_limit`, and `internal_error`. Sending or receiving `error` is terminal. A peer SHOULD send one safe error when possible, then close; it MUST NOT send an error in response to an error. Unsafe framing errors close without a JSON response.
+
+Wrong-code, exporter-binding, `hello`-binding, and otherwise valid sender-confirmation verification failures share `authentication_failed` or silent close. A correctly encoded and ordered receiver confirmation that fails sender-side verification has the same terminal outcome but never changes the receiver's counter. An unavailable, expired, exhausted, consumed, or nonexistent ceremony may use the same behavior earlier in pairing. Ceremony existence, expiry, protocol phase, timing, and availability are not promised to be indistinguishable, and implementations MUST NOT perform a dummy PAKE merely to hide them. No error or other message reports remaining attempts. All reason and code sets are closed. An unknown `transfer_response`, `file_result`, or `cancel` value is `invalid_message`. An unknown `error` code closes the connection without a response.
+
+There are no message, request, transfer, session, correlation, or file IDs. One connection carries at most one transfer and protocol state supplies context.
 
 ## Framing
 
-Serialization does not delimit a TCP stream. Proposed version 1 frame header:
+TCP and TLS are streams, so every JSON control object and binary file chunk uses this 12-byte header:
 
 ```text
 offset  size  field
-0       4     magic = "LNWV"
-4       1     frame-format version = 1
-5       1     flags (control/data, protected hint, critical; reserved bits zero)
-6       2     header length = 12, unsigned big-endian
-8       4     payload length, unsigned big-endian
-12      N     exactly one serialized envelope
+0       4     magic: ASCII "LNWV"
+4       1     frame version: 1
+5       1     kind: 0 = JSON, 1 = DATA
+6       2     header length: unsigned big-endian 12
+8       4     body length: unsigned big-endian
+12      N     body: exactly body length bytes
 ```
 
-A four-byte big-endian length prefix would be smaller, but it gives the parser no magic value, framing version, or frame class, and makes an accidental cross-protocol connection harder to diagnose. I plan to use the 12-byte header for version 1. It has no CRC: a CRC is not authentication, and TLS or the session AEAD already detects protected corruption. If the header later needs to grow, that change gets a new frame-format version rather than a quiet reinterpretation of version 1.
+There are no flags. Other magic values, frame versions, kinds, or header lengths are invalid. A JSON body is 1 through 1,048,576 bytes under the generic hard allocation bound. After bounded parsing identifies `type`, the 4,000-byte `hello`, 4,096-byte `pairing`, and 262,144-byte `transfer_request` limits apply. A DATA body is 1 through 1,048,576 raw file bytes; a zero-byte file has no DATA frame.
 
-Parser requirements:
+A receiver MUST accumulate partial headers and validate the complete header. For JSON it MUST reject a declared body over the generic 1 MiB limit before allocation; for DATA it MUST reject a body over the 1 MiB DATA limit or the current file's remaining bytes before allocation or payload processing. It then reads exactly the bounded declared body and performs a bounded parse to identify the JSON message before enforcing its message-specific limit. It MUST handle multiple frames in one read and MUST bound incomplete-frame buffers, parsed JSON allocations, in-flight pairing states, and queued outbound DATA. A malformed header or a body over a generic hard bound is terminal and the receiver MUST NOT read or allocate the claimed body. Pairing or `hello` excess is `invalid_message`; a structurally valid `transfer_request` excess is a rejecting `transfer_response` with reason `invalid_manifest`.
 
-- Accumulate fixed header across partial reads; never assume a read is one frame.
-- Validate magic, version, header length, reserved flags, and class maximum before allocating payload.
-- Control payload ≤1 MiB; data frame ≤negotiated chunk plus bounded envelope and never above proposed 1,048,640 bytes.
-- Read exactly length bytes, parse exactly one envelope, reject trailing/unconsumed bytes and payload-length mismatch.
-- Handle multiple complete frames already buffered without starving cancellation/control processing.
-- On invalid/huge length, close without reading the claimed payload. Malformed CBOR, excessive nesting/collections, duplicate keys, or invalid type yields one bounded error only if safe.
-- Limit buffered incomplete bytes and apply header/payload read deadlines to defeat slow sends.
+DATA is valid only while receiving the current file after `ready`. It contains no JSON, index, offset, or length field beyond the frame header. Its bytes implicitly continue the current manifest entry, and its body length MUST NOT exceed that file's remaining declared size.
 
-Large file chunks remain bounded data frames; files are never one frame.
-
-## Control and data mapping
-
-Initial TCP profile uses one framed stream. A scheduler prioritizes control messages and limits queued chunk bytes; it cannot reorder wire bytes already written. Separate TCP data connections add authentication, lifecycle, and firewall complexity and are not recommended initially. A future QUIC profile should use one control stream and one stream per file, with the same logical messages or a separately versioned data-stream header. Multiple parallel streams and resume remain capability-negotiated future features.
+TLS 1.3 is the sole record-protection layer for both JSON and DATA. SPAKE2 output does not encrypt frames or add an application AEAD. One TCP/TLS connection carries at most one transfer; control and DATA frames share that one ordered stream.

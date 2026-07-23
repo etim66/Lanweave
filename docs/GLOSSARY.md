@@ -1,44 +1,40 @@
 # Glossary
 
-This glossary is normative for terminology in specification revision 0.1.
+These are the canonical terms for the experimental version 1 baseline. Wire message names are written exactly as lower-case identifiers; `DATA` is an upper-case frame kind rather than a JSON message name.
 
 | Term | Definition |
 | --- | --- |
-| Advertisement | DNS-SD service instance and records published by a running Lanweave instance. It is a discovery hint, not proof of identity. |
-| Authentication | Establishing that session messages are bound to the cryptographic keys and pairing context expected for the peer. It is distinct from authorization. |
-| Authorization | Permission to perform an action; initially, the receiver's explicit approval plus successful one-time pairing. |
-| Capability | A named optional protocol behavior that peers advertise and explicitly negotiate. |
-| Chunk | A bounded, ordered byte range of one file identified by file ID, offset, and length. |
-| Cipher | An encryption algorithm. Lanweave requires an authenticated-encryption construction, not encryption alone. |
-| Control message | A small state/coordination message. Control frames have a lower size limit than data frames. |
-| Data message | A message carrying file bytes, initially `FileChunk`. |
-| Device ID | Stable, non-secret identifier for one installation, derived from or durably associated with its persistent device identity. It is not authorization by itself. |
-| Device identity | Persistent Ed25519 key pair and its device ID association. |
-| Discovery | Finding advertisements and resolving service instances to candidate addresses and ports. |
-| File | One selected regular-file byte stream within a transfer, identified by a file ID. Directories and symbolic links are not files in version 1.0. |
-| Frame | Length-delimited byte unit carrying one serialized Lanweave message over a stream transport. |
-| Instance ID | Random identifier unique to one running process lifetime; it prevents confusing simultaneous/restarted instances. |
-| Initiator | Peer that opens the transport connection, normally the sender. |
-| Key agreement | Cryptographic process by which peers establish shared key material without transmitting the resulting session key. |
-| Local device | Device on which the current implementation is running. |
-| Message ID | Unique identifier for one logical message, used for diagnostics, duplicate detection, and correlation—not alone for replay prevention. |
-| Nonce | Number used once with a particular AEAD key. Reuse under one key can be catastrophic. |
-| Pairing | Human-authorized process binding receiver approval and token verification to the peers and key exchange. |
-| Pairing session | Bounded pre-transfer context from token challenge through secure-session confirmation, identified by pairing-session ID. |
-| Peer | Another Lanweave Protocol participant. Discovery does not make a device trustworthy. |
-| Protocol | Rules, messages, states, validation, and security requirements that interoperable implementations follow. |
-| Receiver | Peer asked to accept and write files. Normally the responder. |
-| Request ID | Identifier for one transfer proposal, from `TransferRequest` until rejection, expiry, cancellation, or association with a transfer. |
-| Responder | Peer accepting an incoming connection, normally the receiver. |
-| Secure session | Negotiated, pairing-authenticated, confidential, integrity-protected protocol context with replay-resistant sequencing, identified by secure-session ID. |
-| Sender | Peer that reads and transmits selected files. Normally the initiator. |
-| Session ID | Context-specific identifier; documents use the precise term pairing-session ID or secure-session ID to avoid ambiguity. |
-| Session identity | The secure-session ID plus authenticated peer identities, negotiated version/capabilities, transcript hash, and traffic-key context. |
-| Token ID | Public random identifier for one token challenge. It is not the token and reveals no token value. |
-| Transfer | One approved set of one or more files, identified by transfer ID. |
-| Transfer ID | Unique identifier assigned after acceptance to the concrete transfer associated with a request. |
-| Transfer request | Metadata-only proposal describing sender, file count, total bytes, and sanitized summaries; it contains no file content. |
-| Transport | Ordered connection mechanism that carries frames; the proposed initial profile is TCP with TLS 1.3 channel protection. |
-| Wire format | Exact bytes used for frames, serialized envelopes, messages, and cryptographic records. |
-
-Additional identity terms are defined in [Message Format](MESSAGE_FORMAT.md); role and phase semantics are defined in [Protocol](PROTOCOL.md).
+| Advertisement | An untrusted DNS-SD service instance that provides candidate connection information and, at most, the `v=1` hint. |
+| Approval | The receiver's post-pairing local decision to accept the exact immutable manifest as a whole. Pairing does not imply approval, approval does not amend the manifest, and wire acceptance follows only after destination preparation succeeds. |
+| Ceremony | Receiver-initiated lifetime of one pairing code and its atomic state. It exists only in memory, outlives individual connections, expires after 120 monotonic seconds, permits at most five failed sender-confirmation verifications across reconnects, and can become sender-confirmed once. Connection, source, CPU, and in-flight PAKE bounds are separate controls. |
+| Pairing code | Uniform CSPRNG 8-digit decimal string generated by the receiver, including possible leading zeros, and shared privately out of band. It is memory-only and one-use. |
+| Control frame | A bounded frame whose payload is one strict JSON control value. |
+| Ephemeral connection identity | Fresh TLS certificate and private key generated for one connection and discarded afterward. It is not a persistent device identity; erasure of all private-key representations is an implementation review gate. |
+| TLS exporter | The 32-byte RFC 9266 TLS 1.3 exporter value produced with label `EXPORTER-Channel-Binding` and no context. It is one field in the specified SPAKE2 AAD for confirmation-key derivation, not a field in transcript `TT`. |
+| SPAKE2 AAD | Additional authenticated data encoded as four-byte big-endian length-prefixed fields in this order: profile label, TLS exporter, exact sender `hello` JSON body bytes, exact receiver `hello` JSON body bytes. The `hello` inputs exclude frame headers and are not inserted into RFC transcript `TT`. |
+| `hello` | First application control message after TLS 1.3, asserting exact experimental protocol version `1`. The fixed profile is not selected or negotiated on the wire. |
+| SPAKE2-P256-SHA256-HKDF-HMAC | Fixed RFC 9382 PAKE profile used by version 1. The sender is role A and the receiver is role B; there is no algorithm negotiation. |
+| Manifest | The immutable ordered list of 1..N selected regular files. Each entry contains only a filename and exact size; array position defines transfer order. It is sent once in `transfer_request`. |
+| `pairing` | Control message used exactly four times after `hello`: sender A share, receiver B share, sender A confirmation, then receiver B confirmation. Its `step` is `share` or `confirm`; direction and state determine the role. |
+| `transfer_request` | First post-pairing control message, proposing the complete manifest for one transfer. There is no later metadata phase. |
+| `transfer_response` | Control message accepting or rejecting the exact whole manifest. An accepting response is sent only after destination preparation succeeds; preparation failure rejects. |
+| Provisional TLS | TLS 1.3 connection using an ephemeral connection identity before SPAKE2 mutual confirmation. The term is reserved for this prepairing phase. |
+| Sender-confirmed | Ceremony state entered when the receiver verifies sender confirmation `cA`. The code is no longer reusable, but the peers are not yet mutually paired; receiver pairing requires `cB` to be committed/flushed to TLS, and sender pairing requires verification of `cB`. |
+| Pairing-authenticated connection | Live TLS 1.3 connection after the required confirmation commit/flush and peer verification steps complete with the shared pairing code, fixed roles/profile, exact `hello`-body AAD, and that connection's exporter. It has not approved any manifest and remains experimental, not safe for sensitive use until audit. |
+| `ready` | Receiver control message sent only after pairing, separate exact-manifest approval, successful destination preparation, and an accepting `transfer_response`. It indicates readiness to begin the approved manifest; the sender cannot send file data before receiving it. |
+| Frame | A length-delimited unit on the single ordered connection, consisting of a fixed header and payload. |
+| Frame kind | Header value selecting either a JSON control payload or a raw binary `DATA` payload. Unknown kinds are rejected in version 1. |
+| `DATA` | Frame kind carrying raw bytes for the current file. It is not JSON and carries no independent file identifier or offset; state and TCP order identify its position. |
+| Current file | The one manifest entry currently being received. Files are processed sequentially. |
+| Partial file | Non-final destination-side temporary file for the current file. It is deleted on failure or cancellation. |
+| `file_end` | Sender control message marking the end of `DATA` for the current file and providing the information required to verify it. |
+| `file_result` | Receiver control message reporting success or failure for the current file. At most one result is sent; interruption may prevent any result. A successful result follows verification and finalization. |
+| File result | The semantic outcome represented by `file_result`; it is not a TCP acknowledgement. |
+| Verified prefix | Contiguous prefix of manifest files that each passed verification and were safely finalized. It is retained if a later file fails. |
+| Fail-fast | Rule that the first file failure ends the transfer, deletes the current partial, retains the verified prefix, and leaves later files unattempted. |
+| `cancel` | Control message requesting terminal cancellation of the connection in any valid nonterminal state. If a file transfer is active, the current partial is cleaned up and the verified prefix remains. |
+| `error` | Control message reporting a bounded connection-level protocol or security failure when a more specific response is not appropriate. |
+| Sender | Peer with SPAKE2 role A that enters the privately shared pairing code, selects the manifest, and sends file bytes after approval. |
+| Receiver | Peer with SPAKE2 role B that begins the ceremony, generates and privately shares the pairing code, separately approves the exact manifest, writes files, and sends each `file_result`. |
+| Transfer | One separately approved manifest carried over the one connection admitted by a ceremony. The final file's verified `file_result` ends it; there is no transfer-complete handshake. |
+| Platform-equivalent names | Distinct manifest names that the destination platform or filesystem would resolve as the same entry, including relevant case or normalization equivalence. They are rejected. |

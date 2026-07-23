@@ -1,94 +1,87 @@
 # File Transfer
 
-## Model and ordering
+This document gives normative file-handling detail for experimental protocol version 1. Message schemas and framing are defined in [Message Format](MESSAGE_FORMAT.md); connection sequencing and security requirements are defined in [Protocol](PROTOCOL.md).
 
-The sender starts with regular files selected on the local machine and opens them in a way that makes obvious changes easier to detect. The first `TransferRequest` is intentionally modest: safe display names, file count, and sizes. It does not include file contents or the sender's absolute paths.
+## Pairing prerequisite
 
-After the pairing-authenticated session is confirmed, the sender provides one `FileMetadata` record per file, including the exact length and an optional precomputed SHA-256 digest. The receiver validates the whole manifest and prepares its destination before it sends `TransferReady`.
+Pairing MUST complete before transfer disclosure or approval. After TLS and `hello`, the peers complete the fixed SPAKE2 profile, including mutual confirmation and binding to the live TLS exporter. The sender MUST NOT send `transfer_request`, a manifest, or any filename, size, or file count before pairing succeeds.
 
-Version 1.0 transfers files one at a time in manifest order. That is less ambitious than multiplexing, but it keeps flow control, disk policy, progress, and failure handling understandable. I can add parallel files later if measurements justify the extra states.
+Pairing authenticates the live channel, not a transfer the receiver has not yet seen. After pairing, the sender sends exactly one `transfer_request`; the receiver then parses it within the fixed wire maxima, validates and displays the complete manifest, obtains separate explicit approval, and prepares the destination. Lower local file-count, total-size, storage, and resource policies are applied only during this post-pairing admission. Preparation or policy failure produces a rejecting `transfer_response`. Only after successful preparation does the receiver send an accepting `transfer_response`, immediately followed by `ready`; DATA remains forbidden until `ready`.
 
-## Metadata and names
+## Manifest
 
-Each file has a unique file ID, display name, exact unsigned 64-bit length, ordinal, and SHA-256 when available. Optional media type and modified time are informational and MUST NOT drive execution or integrity. Sender-local paths, owners, permissions, ACLs, extended attributes, and symlink targets are excluded initially.
+The sender MUST build the manifest locally from 1 through 1,024 user-selected regular files. These are fixed wire/parser bounds; a receiver applies any lower local policy only during post-pairing manifest admission. Local construction may occur before pairing, but no part of it may be transmitted before pairing. The sender MUST reject directories, symlinks, special files, and anything it cannot represent as a single filename component. Each immutable entry contains only:
 
-The receiver:
+- `name`: non-empty UTF-8, at most 255 encoded bytes, with no path separators or control characters;
+- `size`: the exact byte length, from zero through `2^53-1`.
 
-1. Treats the name as an untrusted single-component suggestion.
-2. Sanitizes/displays it without terminal controls.
-3. Applies destination OS rules and local collision policy.
-4. Maps the file ID to a locally chosen final name under a user-selected root.
-5. Never returns the local destination path to the sender unless a future privacy-reviewed feature needs it.
+Array position is the file's zero-based index and transfer order. Count and total size are derived with checked arithmetic. There are no file IDs, explicit ordinals, paths, timestamps, permissions, media types, or pre-transfer hashes, and there is no second metadata phase.
 
-Invalid UTF-8 names cannot be represented in the initial interoperable schema. The sender must generate a safe replacement display name and may indicate `name_was_lossy=true`; a future opaque-byte name capability must define OS mappings. Directories/deep paths are unsupported.
+The sender SHOULD open and inspect each source before requesting the transfer and keep a stable handle where practical. Before sending a file, it MUST confirm that the source is still a regular file with the declared size. If it cannot send the separately approved manifest unchanged, it MUST send terminal `cancel` rather than edit the manifest.
 
-## Source consistency
+## Name admission
 
-Open and inspect each regular file before the request. Keep a stable handle where practical. Before and after streaming, compare file identity, type, size, and relevant modification metadata. If it changes, cancel that file/transfer with `FileUnavailable` rather than silently sending a mixed version. True snapshot semantics need filesystem-specific support and are future work.
+Names are untrusted filename components received only after authenticated pairing, not destination paths. Pairing does not make them safe and does not imply consent. Before sending an accepting `transfer_response`, the receiver MUST apply its actual destination-platform validity and equivalence rules, including normalization and case behavior where applicable. It MUST reject the entire manifest if:
 
-Zero-byte files are valid: send metadata, no `FileChunk`, then `FileComplete`; receiver hashes the empty byte string and finalizes an empty file.
+- any name is invalid;
+- two requested names are platform-equivalent;
+- a requested name is platform-equivalent to an existing destination;
+- it cannot safely plan every final name and required resource.
 
-## Chunking and streaming
+The receiver MUST NOT sanitize into a different name, auto-rename, or overwrite. User consent applies to the displayed complete manifest exactly as sent. Acceptance is all-or-nothing.
 
-- Default negotiated payload: 256 KiB; legal range 64 KiB–1 MiB and never above data-frame maximum.
-- Read one or a small bounded number of chunks ahead. Never load an entire file or manifest payload into memory.
-- Each chunk identifies transfer ID, file ID, zero-based offset, data length, bytes, and optional end hint. The protected session sequence supplies replay/order protection.
-- Initially require contiguous monotonically increasing offsets per file. Duplicate or gap is `InvalidMessage`/`UnexpectedMessage` and fails the transfer.
-- Receiver validates `offset + length` with checked arithmetic and against declared file length before write.
-- Hash exactly accepted bytes while streaming to the temporary file.
+## Destination handling
 
-## Flow control, acknowledgement, and backpressure
+After local approval but before sending an accepting `transfer_response`, the receiver MUST prepare the destination for the exact manifest. Preparation includes selecting and securely opening the destination root, rechecking name and collision rules, admitting storage and local resource policy, and creating the current temporary file under receiver control, preferably in the final destination directory, with an unpredictable name, create-new and no-follow behavior, and restrictive permissions. If any preparation step fails, the receiver sends a rejecting `transfer_response` and MUST NOT report acceptance.
 
-| Strategy | Benefit | Cost |
-| --- | --- | --- |
-| Every chunk | Precise application progress/checkpoint | RTT chatter and poor throughput if stop-and-wait |
-| Ranges | Handles out-of-order/parallel data | More complex state; unnecessary for sequential TCP 1.0 |
-| Cumulative ACK | Compact highest contiguous offset | Cannot describe holes, which 1.0 forbids |
-| Transport reliability only | Minimal protocol overhead | No application confirmation that disk/write/hash advanced |
-| Checkpoint ACK | Bounded sender window and useful progress | Some duplicate state atop TCP |
+After preparation succeeds, the receiver sends the accepting `transfer_response` followed by `ready`. The receiver MUST NOT wait for DATA or perform another fallible preparation phase between those messages. Temporary names and local destination paths are never sent to the peer.
 
-My working choice is to let TCP/TLS handle retransmission while Lanweave reports application progress with cumulative `ChunkAcknowledgement` messages. The receiver sends one after 4 MiB of accepted data, after one second, or at the end of the file. An 8 MiB default receive window bounds how far ahead the sender may run, and ordinary socket backpressure may make that window smaller.
+The receiver MUST write only to the current temporary file. After successful length and hash verification, it MUST close or flush according to local durability policy and finalize with an atomic no-replace operation where the platform supports one. If safe no-replace finalization cannot be guaranteed, the file fails. Lanweave never overwrites an existing file in version 1.
 
-An acknowledgement means that Lanweave accepted the bytes, not necessarily that the operating system has made them durable. Version 1.0 should report `durable=false` until I have chosen and documented an fsync policy.
+Multi-file transfer is not globally atomic. Each verified file is final before the next starts. If a later file fails, the verified prefix remains.
 
-Cancellation/control frames receive priority over queued chunks. Receiver sends updated window or zero window if disk is temporarily blocked, subject to inactivity timeout.
+## Sequential data
 
-## Hashing strategy
+After `ready`, both peers set the current index to zero. The sender sends zero or more raw DATA frames for that file, with one or more required for a non-empty file. Each DATA frame contains 1 through 1 MiB bytes. DATA carries no index or offset; stream order and state identify its file and position.
 
-| Time | Advantage | Cost/limitation |
-| --- | --- | --- |
-| Before send | Receiver knows expected hash before bytes; catches source changes against later stream | Reads huge file twice; delays request and may become stale |
-| During send | No extra sender read; hashes exact transmitted bytes | Expected hash known only at `FileComplete` |
-| Receiver during write | No extra receiver read; hashes exact accepted stream | Depends on correct streaming implementation |
-| Receiver after write | Independent second pass catches some I/O/logic issues | Doubles disk reads and delays completion |
+The receiver MUST reject a DATA frame outside the receiving-file state or larger than the current file's remaining declared bytes. It increments the current byte count and SHA-256 state only for bytes successfully written to the current temporary file. Neither peer may advance to another index independently.
 
-For the first implementation, the sender hashes while it reads and puts the final digest in `FileComplete`. The receiver hashes while it writes and compares the result before it gives the file its final name. A small file, or a file with a trustworthy cached digest, may also include the hash in `FileMetadata`; if it does, `FileComplete` must repeat the same value.
+TCP/TLS supplies reliable ordering, retransmission, and backpressure. Implementations MUST bound socket, file-I/O, and outbound queues and SHOULD read only a small bounded amount ahead. Version 1 adds no chunk ACK or application flow window.
 
-I do not want to make every large transfer wait for a complete pre-read. A later high-assurance mode may read the temporary file again after flushing, but the UI should be honest about the extra I/O.
+For a zero-byte file the sender sends no DATA. It immediately sends:
 
-SHA-256 provides content integrity when delivered inside the authenticated session; by itself it does not authenticate the sender.
+```json
+{"type":"file_end","index":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+```
 
-## Destination and finalization
+## Verification
 
-- Preflight total declared bytes plus safety margin and local quota before `TransferReady`; recheck/enforce during writes.
-- Create each temp file in the final destination directory with unpredictable local name, restrictive permissions, and create-new/no-follow behavior.
-- Default collision policy is reject or locally rename (for example `name (1).ext`) after explicit UI display. Never silently overwrite.
-- An approved overwrite writes a new temp file and atomically replaces only after verification; platform semantics and backup policy require testing.
-- After length/hash success, flush as configured, close safely, atomically rename on the same filesystem, then mark file complete.
-- A multi-file transfer is not globally atomic. If a later file fails, already finalized files remain and UI reports partial completion; initial policy may instead delay all renames, at greater disk/cleanup complexity. This is **Needs Research**.
+The sender computes SHA-256 over exactly the bytes read into DATA frames. After it has sent exactly the declared size, it sends `file_end` for the current index and digest. It MUST then wait without sending DATA for another file.
+
+The receiver accepts `file_end` only for the current index. It compares the received byte count with the manifest size and its independently computed digest with `sha256`. On success it finalizes the file and sends:
+
+```json
+{"type":"file_result","index":0,"status":"verified"}
+```
+
+Only after receiving that result may the sender advance to the next manifest index. Before sending a verified result for a non-final file, the receiver advances its current index and creates the next temporary file. If that creation fails, it sends the verified result for the completed file followed immediately by a failed result for the new current index and accepts no DATA for it. Receipt of a verified result for the final index completes the transfer; no additional completion or close message exists.
+
+SHA-256 checks content equality on the paired and separately approved TLS channel. A digest by itself does not authenticate a peer or approve content. TLS remains the sole record-protection layer; the PAKE key is never used as a file-encryption key.
 
 ## Failure and cleanup
 
-On cancellation, network loss, timeout, write error, excessive bytes, or hash mismatch, stop accepting chunks, close handles, and delete partial temp files by default. A cleanup error is logged locally with a redacted path. Partials are not exposed under final names. Initial version has no resume; keeping partials provides little value and increases privacy/storage risk.
+An early `file_end`, excess DATA, digest mismatch, write error, insufficient storage, or no-replace finalization error fails the current file. The receiver MUST remove its current temporary file, retain the already verified prefix, and send exactly one failed result when the connection is still usable. It MAY send that result while the sender is still sending DATA:
 
-Insufficient storage before readiness yields `InsufficientStorage`; during transfer it aborts the entire transfer. Illegal names yield `InvalidFilename` before readiness. A missing/changed sender source yields `FileUnavailable`. Hash mismatch yields `HashMismatch` and no finalization.
+```json
+{"type":"file_result","index":0,"status":"failed","code":"hash_mismatch"}
+```
+
+No later file is attempted. After a failed result, `cancel`, `error`, timeout, or connection interruption, partial data is deleted and the connection closes. Cleanup failures are handled and logged locally without exposing local paths to the peer.
 
 ## Progress
 
-Per-file progress is accepted contiguous bytes / declared bytes; transfer byte progress is sum of accepted bytes / declared total. Zero-total transfers display file-count progress and complete normally. UI must label sender “sent/acknowledged” separately from receiver “verified/finalized.” Do not exceed 100% if malicious counts arrive; validation should have rejected them.
+Receiver byte progress is the sum of finalized file sizes plus bytes written for the current file, divided by the checked manifest total. For an all-zero-byte manifest, progress uses verified file count. Sender UI MUST distinguish bytes handed to the transport from files confirmed `verified`; TCP delivery alone is not file completion.
 
-## Resume and parallelism
+## Deferred
 
-Resume, content-addressed chunks, sparse-file support, range acknowledgements, and parallel files are not part of version 1.0.
-
-When I design resume, it will need authenticated durable checkpoints, a way to prove the source file is still the same, clear ownership of temporary files, chunk hashes, expiry, and fresh session keys and nonces. Reusing an old session ID is not a resume protocol.
+Resume, sparse files, directories, paths, extra metadata, content-addressed chunks, chunk acknowledgements, overwrite, rename, parallel files, and multi-transfer connections are not part of version 1.
