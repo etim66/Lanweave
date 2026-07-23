@@ -84,7 +84,6 @@ The pairing library is not yet selected. Lanweave must not implement cryptograph
 | [Threat model](docs/THREAT_MODEL.md) | Threats, controls, and remaining risks |
 | [Testing strategy](docs/TESTING_STRATEGY.md) | TUI, protocol, filesystem, and security tests |
 | [Implementation roadmap](docs/IMPLEMENTATION_ROADMAP.md) | High-level dependency gates |
-| [Detailed implementation plan](docs/IMPLEMENTATION_PLAN.txt) | Six-week plan split into small pull requests |
 | [Glossary](docs/GLOSSARY.md) | Plain-language project terms |
 
 ## Security Status
