@@ -53,7 +53,7 @@ sequenceDiagram
         P->>P: Verify and safely finalize
         P-->>Q: file_result(verified)
     end
-    Note over Q,P: Transfer ends; session returns to idle
+    Note over Q,P: Transfer ends, session returns to idle
 ```
 
 ## Transfer Rejection
@@ -67,7 +67,7 @@ sequenceDiagram
     P->>U: Show file names, sizes, count, total
     U-->>P: Reject
     P-->>Q: transfer_response(user_rejected)
-    Note over Q,P: No DATA; session remains authorized and idle
+    Note over Q,P: No DATA, session remains authorized and idle
 ```
 
 ## Reverse Transfer
@@ -82,7 +82,7 @@ sequenceDiagram
     I-->>R: ready
     R->>I: DATA and file_end
     I-->>R: file_result(verified)
-    Note over I,R: Pairing roles stayed fixed; transfer roles changed
+    Note over I,R: Pairing roles stayed fixed, transfer roles changed
 ```
 
 ## Idle And Manual Close
@@ -98,5 +98,5 @@ sequenceDiagram
         A->>B: session_close(idle_timeout)
         A-xB: Close transport and clear authorization
     end
-    Note over A,B: A later session repeats pairing; no trusted devices
+    Note over A,B: A later session repeats pairing, no trusted devices
 ```
